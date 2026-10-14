@@ -7,10 +7,12 @@ import random
 import string
 import io
 import base64
+import re
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
 from app.password_hasher import hash_password, is_bcrypt_hash, verify_password
+from app.card_inventory import INVENTORY_CARD_TYPES, split_card_inventory, join_card_inventory
 from app.specification import (
     DEFAULT_SPEC_KEY,
     canonicalize_specification,
@@ -218,7 +220,7 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS cards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image')),
+                type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image', 'grouped_data')),
                 api_config TEXT,
                 text_content TEXT,
                 data_content TEXT,
@@ -239,7 +241,7 @@ class DBManager:
             )
             ''')
 
-            # 创建卡密发货记录表：批量卡密每发出一行就落一条，库存扣减与记录写入在同一事务
+            # 每个库存单位（一行或整组）落一条发货记录，与库存扣减同事务
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS card_shipments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1009,11 +1011,11 @@ class DBManager:
                 cursor.execute("ALTER TABLE cards ADD COLUMN image_url TEXT")
                 logger.info("数据库迁移完成：添加image_url列")
 
-            # 检查并更新CHECK约束（重建表以支持image类型）
+            # 更新类型约束，保留已有字段和库存
             self._update_cards_table_constraints(cursor)
 
             # 卡片发货详情文案配置：开关、文案内容、图片映射。
-            # 放在约束重建之后，避免重建时硬编码列丢失新字段。
+            # 兼容缺少发货模板字段的历史数据库。
             cursor.execute("PRAGMA table_info(cards)")
             card_columns = [column[1] for column in cursor.fetchall()]
             delivery_template_columns = {
@@ -1098,74 +1100,43 @@ class DBManager:
             # 迁移失败不应该阻止程序启动
 
     def _update_cards_table_constraints(self, cursor):
-        """更新cards表的CHECK约束以支持image类型"""
+        """Expand card types while preserving columns, IDs, indexes and triggers."""
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'")
+        schema = cursor.fetchone()[0]
+        constraint = re.search(r"CHECK\s*\(\s*type\s+IN\s*\(([^)]*)\)\s*\)", schema, re.I)
+        if not constraint:
+            return  # Unconstrained legacy tables already accept the new type.
+        allowed = constraint.group(1)
+        missing = [kind for kind in ('image', 'grouped_data') if f"'{kind}'" not in allowed]
+        if not missing:
+            return
+        updated_constraint = "CHECK (type IN (" + allowed + ", " + ", ".join(f"'{kind}'" for kind in missing) + "))"
+        new_schema = schema[:constraint.start()] + updated_constraint + schema[constraint.end():]
+        new_schema = re.sub(r'^(CREATE\s+TABLE\s+)(?:"cards"|`cards`|\[cards\]|cards)(?=\s|\()',
+                            r'\1cards_inventory_migration', new_schema, count=1, flags=re.I)
+        cursor.execute("SELECT sql FROM sqlite_master WHERE tbl_name = 'cards' AND type IN ('index', 'trigger') AND sql IS NOT NULL")
+        dependent_objects = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT seq FROM sqlite_sequence WHERE name = 'cards'")
+        sequence = cursor.fetchone()
+        cursor.execute("PRAGMA table_info(cards)")
+        columns = ', '.join('"' + row[1].replace('"', '""') + '"' for row in cursor.fetchall())
+        cursor.execute("SAVEPOINT migrate_card_types")
         try:
-            # 尝试插入一个测试的image类型记录来检查约束
-            cursor.execute('''
-                INSERT INTO cards (name, type, user_id)
-                VALUES ('__test_image_constraint__', 'image', 1)
-            ''')
-            # 如果插入成功，立即删除测试记录
-            cursor.execute("DELETE FROM cards WHERE name = '__test_image_constraint__'")
-            logger.info("cards表约束检查通过，支持image类型")
-        except Exception as e:
-            if "CHECK constraint failed" in str(e) or "constraint" in str(e).lower():
-                logger.info("检测到旧的CHECK约束，开始更新cards表...")
+            cursor.execute(new_schema)
+            cursor.execute(f"INSERT INTO cards_inventory_migration ({columns}) SELECT {columns} FROM cards")
+            cursor.execute("DROP TABLE cards")
+            cursor.execute("ALTER TABLE cards_inventory_migration RENAME TO cards")
+            for sql in dependent_objects:
+                cursor.execute(sql)
+            if sequence:
+                cursor.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'cards'", sequence)
+            cursor.execute("RELEASE SAVEPOINT migrate_card_types")
+            logger.info("cards表约束更新完成，支持图片与分组卡密")
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT migrate_card_types")
+            cursor.execute("RELEASE SAVEPOINT migrate_card_types")
+            raise
 
-                # 重建表以更新约束
-                try:
-                    # 1. 创建新表
-                    cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS cards_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image')),
-                        api_config TEXT,
-                        text_content TEXT,
-                        data_content TEXT,
-                        image_url TEXT,
-                        description TEXT,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        delay_seconds INTEGER DEFAULT 0,
-                        is_multi_spec BOOLEAN DEFAULT FALSE,
-                        spec_name TEXT,
-                        spec_value TEXT,
-                        user_id INTEGER NOT NULL DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users (id)
-                    )
-                    ''')
-
-                    # 2. 复制数据
-                    cursor.execute('''
-                    INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
-                                          description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                                          user_id, created_at, updated_at)
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                           user_id, created_at, updated_at
-                    FROM cards
-                    ''')
-
-                    # 3. 删除旧表
-                    cursor.execute("DROP TABLE cards")
-
-                    # 4. 重命名新表
-                    cursor.execute("ALTER TABLE cards_new RENAME TO cards")
-
-                    logger.info("cards表约束更新完成，现在支持image类型")
-
-                except Exception as rebuild_error:
-                    logger.error(f"重建cards表失败: {rebuild_error}")
-                    # 如果重建失败，尝试回滚
-                    try:
-                        cursor.execute("DROP TABLE IF EXISTS cards_new")
-                    except:
-                        pass
-            else:
-                logger.error(f"检查cards表约束时出现未知错误: {e}")
-            
     def check_and_upgrade_db(self, cursor):
         """检查数据库版本并执行必要的升级"""
         try:
@@ -5445,7 +5416,7 @@ class DBManager:
                                  buyer_id: str = None, cookie_id: str = None):
         """原子消费指定数量的批量数据；库存不足时不修改任何内容。
 
-        消费成功的每一行都会写入 card_shipments（已发货记录），
+        消费成功的每个库存单位都会写入 card_shipments（已发货记录），
         与库存扣减同事务提交，避免出现扣了库存却查不到发货明细的情况。
         """
         try:
@@ -5463,7 +5434,7 @@ class DBManager:
                 cursor = self.conn.cursor()
 
                 # 获取卡券的批量数据
-                self._execute_sql(cursor, "SELECT data_content, name, user_id FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                self._execute_sql(cursor, "SELECT data_content, name, user_id, type FROM cards WHERE id = ? AND type IN ('data', 'grouped_data')", (card_id,))
                 result = cursor.fetchone()
 
                 if not result or not result[0]:
@@ -5473,7 +5444,8 @@ class DBManager:
                 data_content = result[0]
                 card_name = result[1] or ''
                 card_user_id = result[2] if result[2] is not None else 1
-                lines = [line.strip() for line in data_content.split('\n') if line.strip()]
+                card_type = result[3]
+                lines = split_card_inventory(card_type, data_content)
 
                 if not lines:
                     logger.warning(f"卡券 {card_id} 批量数据为空")
@@ -5488,7 +5460,7 @@ class DBManager:
 
                 consumed_lines = lines[:requested_quantity]
                 remaining_lines = lines[requested_quantity:]
-                new_data_content = '\n'.join(remaining_lines)
+                new_data_content = join_card_inventory(card_type, remaining_lines)
 
                 cursor.execute('''
                 UPDATE cards
@@ -5949,9 +5921,9 @@ class DBManager:
 
     @staticmethod
     def _card_stock_count(card_type: str, data_content: Optional[str]) -> Optional[int]:
-        if card_type != "data":
+        if card_type not in INVENTORY_CARD_TYPES:
             return None
-        return len([line for line in (data_content or "").splitlines() if line.strip()])
+        return len(split_card_inventory(card_type, data_content))
 
     def get_item_delivery_config(
         self,

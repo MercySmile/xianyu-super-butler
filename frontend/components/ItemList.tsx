@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { getCardStockCount, isInventoryCard } from '../lib/cardInventory';
 import {
   Box,
   Edit,
@@ -112,15 +113,16 @@ const cardTypeLabels: Record<Card['type'], string> = {
   api: 'API 动态内容',
   text: '固定文本',
   data: '批量库存',
+  grouped_data: '分组卡密',
   image: '图片内容',
 };
 
 const getCardStockLabel = (card?: Card) => {
   if (!card) return '尚未选择发货库存';
   if (!card.enabled) return '该库存已停用';
-  if (card.type === 'data') {
-    const count = (card.data_content || '').split(/\r?\n/).filter(line => line.trim()).length;
-    return `当前可用 ${count} 条`;
+  if (isInventoryCard(card.type)) {
+    const count = getCardStockCount(card.type, card.data_content);
+    return `当前可用 ${count} ${card.type === 'grouped_data' ? '组' : '条'}`;
   }
   return cardTypeLabels[card.type];
 };

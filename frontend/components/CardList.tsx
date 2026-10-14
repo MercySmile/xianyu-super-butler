@@ -5,6 +5,7 @@ import { getCards, createCard, updateCard, deleteCard } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import { Plus, CreditCard, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Package, Boxes } from 'lucide-react';
 import { EmptyState, PageHeader, SectionHeader } from './ui';
+import { getCardStockCount, isInventoryCard, GROUPED_CARD_EXAMPLE } from '../lib/cardInventory';
 
 const CardList: React.FC = () => {
   const [cards, setCards] = useState<Card[]>([]);
@@ -93,8 +94,8 @@ const CardList: React.FC = () => {
         };
       } else if (editForm.type === 'text') {
         updateData.text_content = editForm.text_content?.trim() || '';
-      } else if (editForm.type === 'data') {
-        updateData.data_content = editForm.data_content?.trim() || '';
+      } else if (isInventoryCard(editForm.type)) {
+        updateData.data_content = editForm.type === 'grouped_data' ? (editForm.data_content || '') : (editForm.data_content?.trim() || '');
       } else if (editForm.type === 'image') {
         updateData.image_url = editForm.image_url?.trim() || '';
       }
@@ -122,12 +123,12 @@ const CardList: React.FC = () => {
 
   const handleAddCard = async () => {
     const name = addForm.name.trim();
-    const content = addForm.content.trim();
+    const content = addForm.type === 'grouped_data' ? addForm.content : addForm.content.trim();
     if (!name) {
       notify('请输入卡密名称');
       return;
     }
-    if (!content) {
+    if (!content.trim() || (addForm.type === 'grouped_data' && !getCardStockCount(addForm.type, content))) {
       notify(addForm.type === 'api' ? '请输入 API 地址' : '请输入卡密内容');
       return;
     }
@@ -143,7 +144,7 @@ const CardList: React.FC = () => {
 
       if (addForm.type === 'text') {
         createData.text_content = content;
-      } else if (addForm.type === 'data') {
+      } else if (isInventoryCard(addForm.type)) {
         createData.data_content = content;
       } else if (addForm.type === 'image') {
         createData.image_url = content;
@@ -183,8 +184,7 @@ const CardList: React.FC = () => {
 
   const enabledCount = cards.filter(card => card.enabled).length;
   const batchInventory = cards.reduce((total, card) => {
-    if (card.type !== 'data' || !card.data_content) return total;
-    return total + card.data_content.split('\n').filter(line => line.trim()).length;
+    return total + getCardStockCount(card.type, card.data_content);
   }, 0);
 
   return (
@@ -218,7 +218,7 @@ const CardList: React.FC = () => {
         <div className="metric-card">
           <p className="metric-card__label">批量库存</p>
           <p className="metric-card__value">{batchInventory}</p>
-          <p className="metric-card__meta">按有效非空行统计</p>
+          <p className="metric-card__meta">普通批量按行，分组卡密按整组统计</p>
         </div>
       </div>
 
@@ -244,9 +244,8 @@ const CardList: React.FC = () => {
               {cards.map((card) => {
                 // 计算库存或内容预览
                 let stockInfo = '';
-                if (card.type === 'data' && card.data_content) {
-                  const lines = card.data_content.split('\n').filter(line => line.trim());
-                  stockInfo = `库存: ${lines.length} 条`;
+                if (isInventoryCard(card.type)) {
+                  stockInfo = `库存: ${getCardStockCount(card.type, card.data_content)} ${card.type === 'grouped_data' ? '组' : '条'}`;
                 } else if (card.type === 'text' && card.text_content) {
                   stockInfo = card.text_content.substring(0, 20) + (card.text_content.length > 20 ? '...' : '');
                 } else if (card.type === 'api' && card.api_config) {
@@ -266,16 +265,17 @@ const CardList: React.FC = () => {
                       </div>
                     </td>
                     <td data-label="类型">
-                      {/* 四类卡券用同一套低饱和色阶区分，不用纯蓝/紫/橙/粉 ——
+                      {/* 卡券用同一套低饱和色阶区分，不用纯蓝/紫/橙/粉 ——
                           表格里几十行并排时，高饱和标签会盖过内容本身 */}
                       <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ${
                         card.type === 'text' ? 'bg-[#fff8d1] text-[#8a6300]' :
-                        card.type === 'data' ? 'bg-[#eef4ff] text-[#3f5f8f]' :
+                        isInventoryCard(card.type) ? 'bg-[#eef4ff] text-[#3f5f8f]' :
                         card.type === 'api' ? 'bg-[#f0f7f3] text-[#3f7a5c]' :
                         'bg-[#f7f2fb] text-[#6b5a8a]'
                       }`}>
                         {card.type === 'text' ? '文本' :
                          card.type === 'data' ? '批量' :
+                         card.type === 'grouped_data' ? '分组卡密' :
                          card.type === 'api' ? 'API' : '图片'}
                       </span>
                     </td>
@@ -389,6 +389,7 @@ const CardList: React.FC = () => {
                       <option value="">请选择类型</option>
                       <option value="text">固定文字</option>
                       <option value="data">批量数据</option>
+                      <option value="grouped_data">分组卡密（多行一组）</option>
                       <option value="api">API接口</option>
                       <option value="image">图片</option>
                     </select>
@@ -471,21 +472,21 @@ const CardList: React.FC = () => {
                 )}
 
                 {/* 批量数据配置 */}
-                {editForm.type === 'data' && (
+                {isInventoryCard(editForm.type) && (
                   <div className="rounded-md border border-gray-200 bg-gray-50 p-4">
-                    <h3 className="font-bold text-gray-900 mb-3">批量数据配置</h3>
+                    <h3 className="font-bold text-gray-900 mb-3">{editForm.type === 'grouped_data' ? '分组卡密配置' : '批量数据配置'}</h3>
                     <div>
-                      <label className="block text-sm font-bold text-gray-700 mb-2">数据内容（一行一个）</label>
+                      <label className="block text-sm font-bold text-gray-700 mb-2">{editForm.type === 'grouped_data' ? '账号资料（多行一组）' : '数据内容（一行一个）'}</label>
                       <textarea
                         value={editForm.data_content || ''}
                         onChange={(e) => setEditForm({ ...editForm, data_content: e.target.value })}
                         className="ios-input h-72 w-full resize-y rounded-md px-3 py-2.5 font-mono text-sm"
-                        placeholder="请输入数据，每行一个：&#10;卡号1:密码1&#10;卡号2:密码2&#10;或者&#10;兑换码1&#10;兑换码2"
+                        placeholder={editForm.type === 'grouped_data' ? GROUPED_CARD_EXAMPLE : '卡号1:密码1\n卡号2:密码2\n兑换码1\n兑换码2'}
                       />
-                      <p className="text-xs text-gray-500 mt-2">支持格式：卡号:密码 或 单独的兑换码</p>
+                      <p className="text-xs text-gray-500 mt-2">{editForm.type === 'grouped_data' ? '每套完整资料算 1 个库存；不同套之间单独一行填写 ======== CARD ========。组内换行和空行会保留，分隔符不会发给买家。' : '支持格式：卡号:密码 或 单独的兑换码'}</p>
                       <p className="text-xs text-gray-500">当前库存：<span className="font-bold text-amber-600">
-                        {editForm.data_content ? editForm.data_content.split('\n').filter(line => line.trim()).length : 0}
-                      </span> 条</p>
+                        {getCardStockCount(editForm.type, editForm.data_content)}
+                      </span> {editForm.type === 'grouped_data' ? '组' : '条'}</p>
                     </div>
                   </div>
                 )}
@@ -627,7 +628,7 @@ const CardList: React.FC = () => {
 
                 <div>
                   <label className="block text-sm font-bold text-gray-700 mb-2">类型</label>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                     <button
                       type="button"
                       onClick={() => setAddForm({ ...addForm, type: 'text' })}
@@ -643,6 +644,14 @@ const CardList: React.FC = () => {
                     >
                       <Package className="w-5 h-5 mx-auto mb-1" />
                       批量
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAddForm({ ...addForm, type: 'grouped_data' })}
+                      className={`rounded-md border p-3 text-sm font-bold transition-colors ${addForm.type === 'grouped_data' ? 'border-amber-400 bg-[#ffe100] text-black' : 'border-gray-200 bg-gray-50 text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      <Boxes className="w-5 h-5 mx-auto mb-1" />
+                      分组卡密
                     </button>
                     <button
                       type="button"
@@ -669,6 +678,8 @@ const CardList: React.FC = () => {
                       ? '固定文字'
                       : addForm.type === 'data'
                         ? '批量数据（一行一个）'
+                        : addForm.type === 'grouped_data'
+                          ? '分组卡密（多行一组）'
                         : addForm.type === 'image'
                           ? '图片 URL'
                           : 'API 地址'}
@@ -691,13 +702,18 @@ const CardList: React.FC = () => {
                           ? '请输入自动发送的固定文字'
                           : addForm.type === 'data'
                             ? 'CODE-123456\nCODE-789012\n...'
+                            : addForm.type === 'grouped_data'
+                              ? GROUPED_CARD_EXAMPLE
                             : 'https://example.com/image.jpg'
                       }
                     />
                   )}
-                  {addForm.type === 'data' && (
+                  {addForm.type === 'grouped_data' && (
+                    <p className="text-xs text-gray-500 mt-2">每套完整资料算 1 个库存；不同套之间单独一行填写 ======== CARD ========。组内换行和空行会保留，分隔符不会发给买家。</p>
+                  )}
+                  {isInventoryCard(addForm.type) && (
                     <p className="text-xs text-gray-500 mt-2">
-                      当前库存：{addForm.content.split('\n').filter(line => line.trim()).length} 条
+                      当前库存：{getCardStockCount(addForm.type, addForm.content)} {addForm.type === 'grouped_data' ? '组' : '条'}
                     </p>
                   )}
                 </div>

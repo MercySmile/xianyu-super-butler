@@ -111,7 +111,7 @@ export interface QuickPhrase {
 export interface Card {
   id: number;
   name: string;
-  type: 'api' | 'text' | 'data' | 'image';
+  type: 'api' | 'text' | 'data' | 'grouped_data' | 'image';
   description?: string;
   enabled: boolean;
   // 文本类型

@@ -6259,7 +6259,7 @@ class XianyuLive:
                     # 固定文字类型：直接使用文字内容
                     delivery_content = rule['text_content']
 
-                elif rule['card_type'] == 'data':
+                elif rule['card_type'] in ('data', 'grouped_data'):
                     # 首次调用按“订单数量 * 每件发货数”一次性扣减，后续只读取内存队列。
                     if delivery_context is not None:
                         batch_queue = delivery_context.get("batch_data_queue")
@@ -6276,6 +6276,8 @@ class XianyuLive:
                             batch_queue = db_manager.consume_batch_data_batch(
                                 rule['card_id'],
                                 required_count,
+                                order_id=order_id, item_id=item_id,
+                                buyer_id=send_user_id, cookie_id=self.cookie_id,
                             )
                             if not batch_queue:
                                 logger.warning(
@@ -6293,7 +6295,10 @@ class XianyuLive:
                             return None
                         delivery_content = batch_queue.pop(0)
                     else:
-                        delivery_content = db_manager.consume_batch_data(rule['card_id'])
+                        delivery_content = db_manager.consume_batch_data(
+                            rule['card_id'], order_id=order_id, item_id=item_id,
+                            buyer_id=send_user_id, cookie_id=self.cookie_id,
+                        )
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：返回图片发送标记，包含卡券ID
