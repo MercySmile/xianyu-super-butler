@@ -886,8 +886,8 @@ class XianyuLive:
         # 初始化订单状态处理器
         self._init_order_status_handler()
 
-        # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        # 构造对象也用于资料查询、商品同步和Cookie补全。
+        # 只有真正进入main监听循环的对象才可注册，避免临时对象覆盖在线连接。
 
     def _init_order_status_handler(self):
         """初始化订单状态处理器"""
@@ -10352,6 +10352,7 @@ class XianyuLive:
     async def main(self):
         """主程序入口"""
         try:
+            self._register_instance()
             logger.info(f"【{self.cookie_id}】开始启动XianyuLive主程序...")
             await self.create_session()  # 创建session
             logger.info(f"【{self.cookie_id}】Session创建完成，开始WebSocket连接循环...")
@@ -10772,10 +10773,11 @@ class XianyuLive:
                     logger.warning(f"【{self.cookie_id}】后台任务清理超时，强制继续")
             
             # 确保关闭session
-            await self.close_session()
-
-            # 从全局实例字典中注销当前实例
-            self._unregister_instance()
+            try:
+                await self.close_session()
+            finally:
+                # Session清理失败时也必须注销；旧实例不会误删后启动的新实例。
+                self._unregister_instance()
             logger.info(f"【{self.cookie_id}】XianyuLive主程序已完全退出")
 
     @staticmethod
