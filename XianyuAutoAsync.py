@@ -1965,7 +1965,8 @@ class XianyuLive:
 
                                 else:
                                     # 普通文本发货内容
-                                    await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
+                                    from app.delivery_template import send_payload
+                                    await send_payload(self, websocket, chat_id, send_user_id, delivery_content)
                                     if len(delivery_contents) > 1:
                                         logger.info(f'[{msg_time}] 【多数量自动发货】第 {i+1}/{len(delivery_contents)} 条已向 {user_url} 发送发货内容')
                                     else:
@@ -6059,6 +6060,7 @@ class XianyuLive:
                             "variant_disabled": "对应商品规格已停用",
                             "binding_disabled": "对应规格的发货绑定已停用",
                             "card_disabled": "对应规格绑定的卡密已停用",
+                            "fixed_text_unavailable": "附带固定文本已删除、停用、类型变化或内容为空",
                         }
                         reason = rule.get("reason") or "unknown"
                         logger.warning(
@@ -6313,6 +6315,16 @@ class XianyuLive:
                 if delivery_content:
                     # 处理备注信息和变量替换
                     final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
+                    fixed_texts = rule.get('fixed_text_cards') or []
+                    if fixed_texts:
+                        parts = [final_content]
+                        parts.extend(
+                            self._process_delivery_content_with_description(
+                                card['text_content'], card.get('description') or '',
+                            )
+                            for card in fixed_texts
+                        )
+                        final_content = '\n\n'.join(parts)
 
                     # 增加对应规则或商品规格绑定的发货次数统计。
                     if rule.get("rule_kind") == "variant_binding":

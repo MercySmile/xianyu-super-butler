@@ -726,6 +726,7 @@ class DBManager:
                 user_id INTEGER NOT NULL,
                 variant_id INTEGER NOT NULL UNIQUE,
                 card_id INTEGER NOT NULL,
+                fixed_text_card_ids TEXT NOT NULL DEFAULT '[]',
                 delivery_count INTEGER NOT NULL DEFAULT 1,
                 delivery_times INTEGER NOT NULL DEFAULT 0,
                 enabled BOOLEAN DEFAULT TRUE,
@@ -1030,6 +1031,11 @@ class DBManager:
                         f"ALTER TABLE cards ADD COLUMN {column_name} {column_type}"
                     )
                     logger.info(f"数据库迁移完成：添加{column_name}列")
+
+            cursor.execute("PRAGMA table_info(variant_delivery_bindings)")
+            binding_columns = {column[1] for column in cursor.fetchall()}
+            if 'fixed_text_card_ids' not in binding_columns:
+                cursor.execute("ALTER TABLE variant_delivery_bindings ADD COLUMN fixed_text_card_ids TEXT NOT NULL DEFAULT '[]'")
 
             # 检查cookies表是否存在remark列
             cursor.execute("PRAGMA table_info(cookies)")
@@ -5925,6 +5931,44 @@ class DBManager:
             return None
         return len(split_card_inventory(card_type, data_content))
 
+    @staticmethod
+    def _parse_fixed_text_card_ids(value) -> List[int]:
+        """Keep the selected text order; malformed bundles must fail closed."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                raise ValueError("附带固定文本配置无效")
+        if value is None:
+            return []
+        if not isinstance(value, list) or any(type(card_id) is not int or card_id < 1 for card_id in value):
+            raise ValueError("附带固定文本必须是有效的卡密 ID 列表")
+        if len(set(value)) != len(value):
+            raise ValueError("同一规格不能重复选择同一份固定文本")
+        return value
+
+    def _get_fixed_text_cards(self, card_ids: List[int], user_id: int) -> List[Dict[str, Any]]:
+        if not card_ids:
+            return []
+        placeholders = ','.join('?' for _ in card_ids)
+        rows = self.conn.execute(
+            f"SELECT id, name, type, enabled, text_content, description FROM cards WHERE user_id = ? AND id IN ({placeholders})",
+            [user_id, *card_ids],
+        ).fetchall()
+        cards = {row[0]: row for row in rows}
+        result = []
+        for card_id in card_ids:
+            row = cards.get(card_id)
+            result.append({
+                "id": card_id,
+                "name": row[1] if row else "已删除或无权使用的固定文本",
+                "enabled": bool(row and row[3]),
+                "available": bool(row and row[2] == 'text' and row[3] and (row[4] or '').strip()),
+                "text_content": row[4] if row else None,
+                "description": row[5] if row else None,
+            })
+        return result
+
     def get_item_delivery_config(
         self,
         cookie_id: str,
@@ -5956,7 +6000,7 @@ class DBManager:
                        pv.enabled, pv.created_at, pv.updated_at,
                        vdb.id, vdb.card_id, vdb.delivery_count,
                        vdb.delivery_times, vdb.enabled,
-                       c.name, c.type, c.enabled, c.data_content
+                       c.name, c.type, c.enabled, c.data_content, vdb.fixed_text_card_ids
                 FROM product_variants pv
                 LEFT JOIN variant_delivery_bindings vdb
                   ON vdb.variant_id = pv.id
@@ -5974,6 +6018,14 @@ class DBManager:
                     payload = json.loads(row[3] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     payload = {}
+                try:
+                    fixed_text_ids = self._parse_fixed_text_card_ids(row[18])
+                    fixed_text_cards = self._get_fixed_text_cards(fixed_text_ids, config_row[1])
+                    fixed_texts_ready = all(card['available'] for card in fixed_text_cards)
+                except ValueError:
+                    fixed_text_ids, fixed_text_cards, fixed_texts_ready = [], [], False
+                if fixed_text_ids and (row[15] not in ('data', 'grouped_data', 'text') or row[10] in fixed_text_ids):
+                    fixed_texts_ready = False
                 variants.append({
                     "id": row[0],
                     "display_name": row[1],
@@ -5994,11 +6046,14 @@ class DBManager:
                     "card_type": row[15],
                     "card_enabled": bool(row[16]) if row[16] is not None else False,
                     "stock_count": self._card_stock_count(row[15], row[17]),
+                    "fixed_text_card_ids": fixed_text_ids,
+                    "fixed_text_cards": [{key: card[key] for key in ('id', 'name', 'enabled', 'available')} for card in fixed_text_cards],
+                    "fixed_texts_ready": fixed_texts_ready,
                 })
 
             configured_count = sum(
                 1 for variant in variants
-                if variant["card_id"] and variant["binding_enabled"] and variant["card_enabled"]
+                if variant["card_id"] and variant["binding_enabled"] and variant["card_enabled"] and variant["fixed_texts_ready"]
             )
             return {
                 "id": config_row[0],
@@ -6047,7 +6102,7 @@ class DBManager:
                 ''',
                 (user_id,),
             )
-            return [{
+            summaries = [{
                 "cookie_id": row[0],
                 "item_id": row[1],
                 "enabled": bool(row[2]),
@@ -6057,6 +6112,30 @@ class DBManager:
                 "complete": bool(row[4]) and (row[5] or 0) == row[4],
                 "delivery_times": row[6] or 0,
             } for row in cursor.fetchall()]
+
+            # Only bundles need extra validation. Single-source summaries keep
+            # their existing count and the supplemental text contents stay private.
+            bundled_rows = self.conn.execute('''
+                SELECT pv.cookie_id, pv.item_id, vdb.card_id, c.type, vdb.fixed_text_card_ids
+                FROM variant_delivery_bindings vdb
+                JOIN product_variants pv ON pv.id = vdb.variant_id
+                JOIN cards c ON c.id = vdb.card_id
+                WHERE vdb.user_id = ? AND vdb.enabled = 1 AND c.enabled = 1
+                  AND vdb.fixed_text_card_ids <> '[]'
+            ''', (user_id,)).fetchall()
+            summary_map = {(entry['cookie_id'], entry['item_id']): entry for entry in summaries}
+            for cookie_id, item_id, card_id, card_type, raw_ids in bundled_rows:
+                try:
+                    ids = self._parse_fixed_text_card_ids(raw_ids)
+                    ready = (not ids or card_type in ('data', 'grouped_data', 'text')) and card_id not in ids
+                    ready = ready and all(card['available'] for card in self._get_fixed_text_cards(ids, user_id))
+                except ValueError:
+                    ready = False
+                summary = summary_map.get((cookie_id, item_id))
+                if not ready and summary:
+                    summary['configured_count'] -= 1
+                    summary['complete'] = False
+            return summaries
 
     def save_item_delivery_config(
         self,
@@ -6103,6 +6182,10 @@ class DBManager:
             if delivery_count < 1:
                 raise ValueError("每单发货数量必须大于等于 1")
 
+            fixed_text_ids = self._parse_fixed_text_card_ids(variant.get('fixed_text_card_ids'))
+            if card_id in fixed_text_ids:
+                raise ValueError("主发货内容不能重复作为附带固定文本")
+
             display_name = str(variant.get("display_name") or "").strip()
             if not display_name:
                 display_name = specification_text(payload) or "默认规格"
@@ -6115,6 +6198,7 @@ class DBManager:
                 "source": str(variant.get("source") or "manual").strip() or "manual",
                 "enabled": bool(variant.get("enabled", True)),
                 "card_id": card_id,
+                "fixed_text_card_ids": fixed_text_ids,
                 "delivery_count": delivery_count,
                 "binding_enabled": bool(variant.get("binding_enabled", True)),
             })
@@ -6133,19 +6217,27 @@ class DBManager:
                 if not cursor.fetchone():
                     raise ValueError("商品不存在或不属于当前用户")
 
-                card_ids = sorted({variant["card_id"] for variant in normalized_variants})
+                card_ids = sorted({card_id for variant in normalized_variants for card_id in [variant['card_id'], *variant['fixed_text_card_ids']]})
                 placeholders = ",".join("?" for _ in card_ids)
                 cursor.execute(
                     f'''
-                    SELECT id FROM cards
+                    SELECT id, type, text_content FROM cards
                     WHERE user_id = ? AND enabled = 1 AND id IN ({placeholders})
                     ''',
                     [user_id, *card_ids],
                 )
-                owned_card_ids = {row[0] for row in cursor.fetchall()}
+                owned_cards = {row[0]: row for row in cursor.fetchall()}
+                owned_card_ids = set(owned_cards)
                 missing_card_ids = [card_id for card_id in card_ids if card_id not in owned_card_ids]
                 if missing_card_ids:
                     raise ValueError(f"卡密不存在、已停用或无权使用：{missing_card_ids[0]}")
+                for variant in normalized_variants:
+                    if variant['fixed_text_card_ids'] and owned_cards[variant['card_id']][1] not in ('data', 'grouped_data', 'text'):
+                        raise ValueError("只有批量卡密、分组卡密或固定文本可以附带固定文本")
+                    for text_id in variant['fixed_text_card_ids']:
+                        text_card = owned_cards[text_id]
+                        if text_card[1] != 'text' or not (text_card[2] or '').strip():
+                            raise ValueError(f"附带内容必须是非空的固定文本：{text_id}")
 
                 cursor.execute("BEGIN IMMEDIATE")
                 cursor.execute(
@@ -6199,12 +6291,13 @@ class DBManager:
                     cursor.execute(
                         '''
                         INSERT INTO variant_delivery_bindings (
-                            user_id, variant_id, card_id, delivery_count, enabled
-                        ) VALUES (?, ?, ?, ?, ?)
+                            user_id, variant_id, card_id, delivery_count, enabled, fixed_text_card_ids
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         ''',
                         (
                             user_id, variant_id, variant["card_id"],
                             variant["delivery_count"], int(variant["binding_enabled"]),
+                            json.dumps(variant['fixed_text_card_ids']),
                         ),
                     )
 
@@ -6280,7 +6373,7 @@ class DBManager:
                        c.data_content, c.image_url, c.enabled, c.description,
                        c.delay_seconds, pv.enabled,
                        c.delivery_template, c.delivery_template_enabled,
-                       c.delivery_template_images
+                       c.delivery_template_images, vdb.fixed_text_card_ids
                 FROM product_variants pv
                 LEFT JOIN variant_delivery_bindings vdb
                   ON vdb.variant_id = pv.id
@@ -6312,6 +6405,14 @@ class DBManager:
             if not bool(row[16]):
                 return {"configured": True, "matched": False, "reason": "card_disabled"}
 
+            try:
+                fixed_text_ids = self._parse_fixed_text_card_ids(row[23])
+                fixed_text_cards = self._get_fixed_text_cards(fixed_text_ids, config[1])
+            except ValueError:
+                return {"configured": True, "matched": False, "reason": "fixed_text_unavailable"}
+            if fixed_text_ids and (row[11] not in ('data', 'grouped_data', 'text') or row[6] in fixed_text_ids or not all(card['available'] for card in fixed_text_cards)):
+                return {"configured": True, "matched": False, "reason": "fixed_text_unavailable"}
+
             api_config = row[12]
             if api_config:
                 try:
@@ -6342,6 +6443,7 @@ class DBManager:
                 "enabled": True,
                 "card_name": row[10],
                 "card_type": row[11],
+                "fixed_text_cards": fixed_text_cards,
                 "api_config": api_config,
                 "text_content": row[13],
                 "data_content": row[14],
@@ -6479,22 +6581,31 @@ class DBManager:
             cursor = self.conn.cursor()
             cursor.execute(
                 '''
-                SELECT pv.cookie_id, pv.item_id, pv.display_name, ii.item_title
+                SELECT pv.cookie_id, pv.item_id, pv.display_name, ii.item_title,
+                       vdb.card_id, vdb.fixed_text_card_ids
                 FROM variant_delivery_bindings vdb
                 JOIN product_variants pv ON pv.id = vdb.variant_id
                 LEFT JOIN item_info ii
                   ON ii.cookie_id = pv.cookie_id AND ii.item_id = pv.item_id
-                WHERE vdb.user_id = ? AND vdb.card_id = ?
+                WHERE vdb.user_id = ?
                 ORDER BY pv.item_id, pv.id
                 ''',
-                (user_id, card_id),
+                (user_id,),
             )
+            references = []
+            for row in cursor.fetchall():
+                try:
+                    fixed_text_ids = self._parse_fixed_text_card_ids(row[5])
+                except ValueError:
+                    fixed_text_ids = []
+                if row[4] == card_id or card_id in fixed_text_ids:
+                    references.append(row)
             return [{
                 "cookie_id": row[0],
                 "item_id": row[1],
                 "variant_name": row[2],
                 "item_title": row[3],
-            } for row in cursor.fetchall()]
+            } for row in references]
 
     def get_items_by_cookie(self, cookie_id: str) -> List[Dict]:
         """获取指定Cookie的所有商品信息

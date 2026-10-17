@@ -55,6 +55,7 @@ interface DeliveryVariantForm {
   specText: string;
   platformSkuId: string;
   cardId: string;
+  fixedTextCardIds: number[];
   deliveryCount: number;
   enabled: boolean;
 }
@@ -91,6 +92,7 @@ const createEmptyVariant = (index = 0): DeliveryVariantForm => ({
   specText: '',
   platformSkuId: '',
   cardId: '',
+  fixedTextCardIds: [],
   deliveryCount: 1,
   enabled: true,
 });
@@ -463,6 +465,7 @@ const ItemList: React.FC = () => {
             specText: variant.spec_text || '',
             platformSkuId: variant.platform_sku_id || '',
             cardId: variant.card_id ? String(variant.card_id) : '',
+            fixedTextCardIds: variant.fixed_text_card_ids || [],
             deliveryCount: Math.max(1, variant.delivery_count || 1),
             enabled: variant.enabled && variant.binding_enabled,
           })),
@@ -544,6 +547,17 @@ const ItemList: React.FC = () => {
       return;
     }
 
+    const invalidTextIndex = variantsToSave.findIndex(variant =>
+      variant.fixedTextCardIds.some(id => {
+        const card = cards.find(candidate => candidate.id === id);
+        return !card || !card.enabled || card.type !== 'text' || !card.text_content?.trim() || String(id) === variant.cardId;
+      }) || new Set(variant.fixedTextCardIds).size !== variant.fixedTextCardIds.length,
+    );
+    if (invalidTextIndex >= 0) {
+      setNotice({ type: 'error', message: `请检查第 ${invalidTextIndex + 1} 个规格的附带固定文本，内容必须有效、已启用且不能重复` });
+      return;
+    }
+
     const key = itemKey(deliveryItem);
     const legacyRule = ruleMap.get(key);
     setSavingKey(key);
@@ -559,6 +573,7 @@ const ItemList: React.FC = () => {
           spec_payload: undefined,
           platform_sku_id: deliveryForm.isMultiSpec ? variant.platformSkuId.trim() : '',
           card_id: Number(variant.cardId),
+          fixed_text_card_ids: variant.fixedTextCardIds,
           delivery_count: Math.max(1, Math.floor(variant.deliveryCount || 1)),
           enabled: variant.enabled,
           binding_enabled: variant.enabled,
@@ -606,6 +621,7 @@ const ItemList: React.FC = () => {
             spec_payload: variant.spec_payload,
             platform_sku_id: variant.platform_sku_id,
             card_id: variant.card_id,
+            fixed_text_card_ids: variant.fixed_text_card_ids || [],
             delivery_count: variant.delivery_count,
             enabled: variant.enabled,
             binding_enabled: variant.binding_enabled,
@@ -1140,6 +1156,7 @@ const ItemList: React.FC = () => {
                       : deliveryForm.variants.slice(0, 1)
                     ).map((variant, index) => {
                       const selectedCard = cards.find(card => String(card.id) === variant.cardId);
+                      const canAttachText = selectedCard && ['data', 'grouped_data', 'text'].includes(selectedCard.type);
                       return (
                         <article key={variant.clientId} className="rounded-md border border-gray-200 bg-white">
                           <div className="flex items-center justify-between gap-3 border-b border-gray-100 px-4 py-3">
@@ -1175,7 +1192,7 @@ const ItemList: React.FC = () => {
                             </div>
                           </div>
 
-                          <div className="grid gap-4 p-4 sm:grid-cols-2">
+                          <div className="grid min-w-0 grid-cols-1 gap-4 p-4 sm:grid-cols-2">
                             {deliveryForm.isMultiSpec && (
                               <>
                                 <div>
@@ -1214,7 +1231,7 @@ const ItemList: React.FC = () => {
                             )}
 
                             <div>
-                              <label className="field-label" htmlFor={`variant-card-${variant.clientId}`}>绑定发货库存</label>
+                              <label className="field-label" htmlFor={`variant-card-${variant.clientId}`}>主发货内容 / 库存</label>
                               <select
                                 id={`variant-card-${variant.clientId}`}
                                 value={variant.cardId}
@@ -1223,7 +1240,7 @@ const ItemList: React.FC = () => {
                               >
                                 <option value="">请选择卡密或内容</option>
                                 {cards.map(card => (
-                                  <option key={card.id} value={card.id} disabled={!card.enabled}>
+                                  <option key={card.id} value={card.id} disabled={!card.enabled || variant.fixedTextCardIds.includes(card.id) || (variant.fixedTextCardIds.length > 0 && !['data', 'grouped_data', 'text'].includes(card.type))}>
                                     {card.name || `卡密 ${card.id}`} · {cardTypeLabels[card.type]}
                                     {card.enabled ? '' : '（已停用）'}
                                   </option>
@@ -1253,6 +1270,66 @@ const ItemList: React.FC = () => {
                                   : `⚠️ 未开启「多数量」：无论买家拍几件都只发 ${variant.deliveryCount || 1} 份。需按件数递增请到商品列表开启「多数量」。`}
                               </p>
                             </div>
+
+                            {(canAttachText || variant.fixedTextCardIds.length > 0) && (
+                              <div className="space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3 sm:col-span-2">
+                                <div>
+                                  <p className="text-sm font-bold text-gray-800">附带固定文本（可选）</p>
+                                  <p className="mt-1 text-xs leading-5 text-gray-500">每份发货先发送主内容，再按以下顺序附上固定文本。卡密按份数扣库存，固定文本重复使用；不添加则只发主内容。</p>
+                                </div>
+                                {variant.fixedTextCardIds.map((textId, textIndex) => {
+                                  const textCard = cards.find(card => card.id === textId);
+                                  const unavailable = textId > 0 && (!textCard || !textCard.enabled || textCard.type !== 'text' || !textCard.text_content?.trim());
+                                  return (
+                                    <div key={textIndex} className="space-y-1">
+                                      <label className="field-label" htmlFor={`variant-text-${variant.clientId}-${textIndex}`}>固定文本 {textIndex + 1}</label>
+                                      <div className="flex items-center gap-2">
+                                        <select
+                                          id={`variant-text-${variant.clientId}-${textIndex}`}
+                                          value={textId || ''}
+                                          onChange={event => updateDeliveryVariant(variant.clientId, { fixedTextCardIds: variant.fixedTextCardIds.map((id, position) => position === textIndex ? Number(event.target.value) : id) })}
+                                          className="ios-input min-w-0 flex-1 rounded-md px-3 py-2.5"
+                                        >
+                                          <option value="">请选择已有固定文本</option>
+                                          {textId > 0 && (!textCard || textCard.type !== 'text') && <option value={textId} disabled>已删除或类型已改变的内容（{textId}）</option>}
+                                          {cards.filter(card => card.type === 'text').map(card => (
+                                            <option key={card.id} value={card.id} disabled={!card.enabled || String(card.id) === variant.cardId || (card.id !== textId && variant.fixedTextCardIds.includes(card.id))}>
+                                              {card.name}{card.enabled ? '' : '（已停用）'}
+                                            </option>
+                                          ))}
+                                        </select>
+                                        <button
+                                          type="button"
+                                          disabled={textIndex === 0}
+                                          onClick={() => {
+                                            const ids = [...variant.fixedTextCardIds];
+                                            [ids[textIndex - 1], ids[textIndex]] = [ids[textIndex], ids[textIndex - 1]];
+                                            updateDeliveryVariant(variant.clientId, { fixedTextCardIds: ids });
+                                          }}
+                                          className="ios-btn-secondary shrink-0 rounded-md px-2 py-2 text-xs disabled:opacity-40"
+                                          aria-label={`上移固定文本 ${textIndex + 1}`}
+                                        >上移</button>
+                                        <button
+                                          type="button"
+                                          onClick={() => updateDeliveryVariant(variant.clientId, { fixedTextCardIds: variant.fixedTextCardIds.filter((_, position) => position !== textIndex) })}
+                                          className="rounded-md p-2 text-red-500 hover:bg-red-50"
+                                          aria-label={`移除固定文本 ${textIndex + 1}`}
+                                        ><Trash2 className="h-4 w-4" /></button>
+                                      </div>
+                                      {unavailable && <p className="text-xs text-red-600">此固定文本不可用，请重新选择或移除；修复前不会自动扣减卡密。</p>}
+                                    </div>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  onClick={() => updateDeliveryVariant(variant.clientId, { fixedTextCardIds: [...variant.fixedTextCardIds, 0] })}
+                                  className="ios-btn-secondary flex items-center gap-2 rounded-md px-3 py-2 text-sm"
+                                ><Plus className="h-4 w-4" />添加固定文本</button>
+                                {!cards.some(card => card.type === 'text' && card.enabled && String(card.id) !== variant.cardId) && (
+                                  <p className="text-xs text-gray-500">请先到「卡密库存」添加并启用固定文字，例如下载地址、教程或售后说明。</p>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </article>
                       );

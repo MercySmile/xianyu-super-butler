@@ -182,6 +182,9 @@ export interface ProductVariantBinding {
   canonical_spec_key?: string;
   platform_sku_id: string;
   card_id: number;
+  fixed_text_card_ids?: number[];
+  fixed_text_cards?: Array<{ id: number; name: string; enabled: boolean; available: boolean }>;
+  fixed_texts_ready?: boolean;
   card_name?: string;
   card_type?: Card['type'];
   card_enabled?: boolean;

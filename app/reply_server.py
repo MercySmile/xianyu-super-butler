@@ -5766,6 +5766,7 @@ class ProductVariantBindingIn(BaseModel):
     spec_payload: Optional[Dict[str, Any]] = None
     platform_sku_id: str = ""
     card_id: int
+    fixed_text_card_ids: List[int] = Field(default_factory=list)
     delivery_count: int = Field(default=1, ge=1)
     enabled: bool = True
     binding_enabled: bool = True

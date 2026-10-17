@@ -603,6 +603,7 @@ export const saveItemDeliveryConfig = async (
       | 'spec_payload'
       | 'platform_sku_id'
       | 'card_id'
+      | 'fixed_text_card_ids'
       | 'delivery_count'
       | 'enabled'
       | 'binding_enabled'

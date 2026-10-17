@@ -19,9 +19,11 @@ SEGMENT_INTERVAL_SECONDS = 0.8
 
 def split_delivery_content(content: str, max_chars: int = MAX_SEGMENT_CHARS) -> list[str]:
     """按最大长度切分文本，优先在换行处断开，避免把一行卡密从中间切断。"""
-    text = (content or "").strip()
-    if not text:
+    text = content or ""
+    if not text.strip():
         return []
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
 
     segments: list[str] = []
     remaining = text
@@ -30,8 +32,10 @@ def split_delivery_content(content: str, max_chars: int = MAX_SEGMENT_CHARS) -> 
         if cut <= 0:
             # 没有可用的换行边界（单行超长），退化为硬切
             cut = max_chars
-        segments.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
+        else:
+            cut += 1  # Keep the newline and field whitespace intact.
+        segments.append(remaining[:cut])
+        remaining = remaining[cut:]
     if remaining:
         segments.append(remaining)
     return segments
