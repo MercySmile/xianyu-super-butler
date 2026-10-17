@@ -183,6 +183,7 @@ async def sync_account_orders(
         ``complete`` 为 False 表示拉取数量少于服务端角标，调用方应关注。
     """
     result: Dict[str, Any] = {
+        "pending_order_ids": [],
         "total": 0,
         "saved": 0,
         "failed": 0,
@@ -218,6 +219,9 @@ async def sync_account_orders(
             try:
                 ok = _save_order(db_manager, cookie_id, parsed)
                 result["saved"] += 1 if ok else 0
+                if ok and normalize_order_status("", parsed.get("status_text")) == "pending_ship":
+                    result["pending_order_ids"].append(order_id)
+
                 result["failed"] += 0 if ok else 1
             except Exception as e:
                 result["failed"] += 1
@@ -272,4 +276,7 @@ async def sync_account_orders(
         f"成功 {result['saved']}，失败 {result['failed']}"
         + ("" if result["complete"] else f"，⚠️ 少于服务端角标 {result['expected']}")
     )
+    if result["pending_order_ids"]:
+        from app.delivery_reconciliation import request_delivery_reconciliation
+        request_delivery_reconciliation(cookie_id, result["pending_order_ids"], source="order_sync")
     return result

@@ -183,6 +183,7 @@ class LiveInstanceRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(XianyuLive.get_instance(ACCOUNT), live)
 
     async def test_full_delivery_after_profile_refresh_uses_live_socket(self):
+        self.enable_delivery_gate()
         live, _ = await self.start_listener()
         await self.refresh_profile()
         live.apply_delivery_block_rules = AsyncMock(return_value={'action': 'allow'})
@@ -209,6 +210,7 @@ class LiveInstanceRegistryTests(unittest.IsolatedAsyncioTestCase):
         live.mark_delivery_sent.assert_called_once_with('order', update_order_status=False)
 
     async def test_disconnected_real_listener_still_blocks_before_consumption(self):
+        self.enable_delivery_gate()
         live, _ = await self.start_listener()
         live.ws.closed = True
         live._auto_delivery = AsyncMock()
@@ -224,6 +226,19 @@ class LiveInstanceRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, result['failed_count'])
         self.assertIn('WebSocket', result['results'][0]['message'])
         live._auto_delivery.assert_not_awaited()
+
+    def enable_delivery_gate(self):
+        # Keep the HTTP/listener mocks while exercising the real durable order gate.
+        from app.db_manager import DBManager
+        gate_db = DBManager(':memory:')
+        self.addCleanup(gate_db.close)
+        gate_db.conn.execute(
+            "INSERT INTO orders(order_id,cookie_id,order_status) VALUES ('order',?,'pending_ship')",
+            (ACCOUNT,),
+        )
+        gate_db.conn.commit()
+        self.db.conn = gate_db.conn
+        self.db.lock = gate_db.lock
 
 
 if __name__ == '__main__':

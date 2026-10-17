@@ -8181,6 +8181,10 @@ async def refresh_single_order(
             receiver_address=result.get('receiver_address') or None,
         )
 
+        if order_status == 'pending_ship':
+            from app.delivery_reconciliation import request_delivery_reconciliation
+            request_delivery_reconciliation(cookie_id, [order_id], source="order_refresh")
+
         log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
         return JSONResponse({
             "success": True,
@@ -8302,7 +8306,10 @@ async def update_order(
                         }
 
                         # 更新数据库
-                        db_manager.insert_or_update_order(**refresh_data)
+                        saved = db_manager.insert_or_update_order(**refresh_data)
+                        if saved and order_status == 'pending_ship':
+                            from app.delivery_reconciliation import request_delivery_reconciliation
+                            request_delivery_reconciliation(cookie_id, [order_id], source="order_refresh")
                         log_with_user('info', f"订单 {order_id} 完整数据已更新到数据库", current_user)
                     else:
                         log_with_user('warning', f"订单 {order_id} 详情获取失败，继续使用现有数据", current_user)
@@ -8510,6 +8517,9 @@ async def refresh_orders_status(
                     )
 
                     if success:
+                        if order_status == 'pending_ship':
+                            from app.delivery_reconciliation import request_delivery_reconciliation
+                            request_delivery_reconciliation(cid, [order_id], source="order_refresh")
                         # 检查是否有更新
                         has_changes = (
                             order_status != current_status or
@@ -8630,304 +8640,315 @@ async def manual_ship_orders(
                 item_id = order.get('item_id')
                 buyer_id = order.get('buyer_id')
 
-                if ship_mode == 'status_only':
-                    # ====== 仅修改闲鱼发货状态 ======
-                    if not item_id:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '订单缺少商品ID'
-                        })
+                from app.delivery_attempt import DeliveryAttempt
+                with DeliveryAttempt(db_manager, order_id, cookie_id,
+                                     status_only=ship_mode == 'status_only') as attempt:
+                    if not attempt.acquired:
+                        results.append({'order_id': order_id, 'success': False,
+                                        'message': attempt.reason})
                         failed_count += 1
                         continue
-
-                    # 获取cookies_str用于创建独立session
-                    cookies_str = user_cookies.get(cookie_id)
-                    if not cookies_str:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '无法获取账号Cookie信息'
-                        })
-                        failed_count += 1
-                        continue
-
-                    # 创建独立的aiohttp session（避免跨异步上下文问题）
-                    import aiohttp
-                    from app.secure_confirm import SecureConfirm
-
-                    try:
-                        async with aiohttp.ClientSession(
-                            headers={'cookie': cookies_str},
-                            timeout=aiohttp.ClientTimeout(total=30)
-                        ) as session:
-                            confirm = SecureConfirm(session, cookies_str, cookie_id, None)
-                            confirm_result = await confirm.auto_confirm(order_id, item_id)
-
-                        if confirm_result and confirm_result.get('success'):
-                            # 更新本地数据库状态
-                            db_manager.insert_or_update_order(
-                                order_id=order_id,
-                                order_status='shipped',
-                                system_shipped=True
-                            )
-                            results.append({
-                                'order_id': order_id,
-                                'success': True,
-                                'message': '已成功修改闲鱼发货状态'
-                            })
-                            success_count += 1
-                        else:
-                            error_msg = confirm_result.get('error', '未知错误') if confirm_result else '确认发货返回空结果'
+                    if ship_mode == 'status_only':
+                        # ====== 仅修改闲鱼发货状态 ======
+                        if not item_id:
                             results.append({
                                 'order_id': order_id,
                                 'success': False,
-                                'message': f'修改发货状态失败: {error_msg}'
+                                'message': '订单缺少商品ID'
                             })
                             failed_count += 1
-                    except Exception as e:
-                        log_with_user('error', f"确认发货异常: {str(e)}", current_user)
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': f'确认发货异常: {str(e)}'
-                        })
-                        failed_count += 1
+                            continue
 
-                elif ship_mode == 'full_delivery':
-                    # ====== 完整发货流程：匹配卡券 + 发送卡券 + 修改状态 ======
-                    if not item_id:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '订单缺少商品ID，无法匹配发货规则'
-                        })
-                        failed_count += 1
-                        continue
+                        # 获取cookies_str用于创建独立session
+                        cookies_str = user_cookies.get(cookie_id)
+                        if not cookies_str:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '无法获取账号Cookie信息'
+                            })
+                            failed_count += 1
+                            continue
 
-                    if not buyer_id:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '订单缺少买家ID，无法发送卡券'
-                        })
-                        failed_count += 1
-                        continue
+                        # 创建独立的aiohttp session（避免跨异步上下文问题）
+                        import aiohttp
+                        from app.secure_confirm import SecureConfirm
 
-                    # 必须有运行中的实例（需要WebSocket发送消息）
-                    live_instance = XianyuLive.get_instance(cookie_id)
-                    if not live_instance:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '该账号未在线运行，无法执行完整发货。请先启动账号。'
-                        })
-                        failed_count += 1
-                        continue
-
-                    if not live_instance.ws or live_instance.ws.closed:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '该账号WebSocket连接已断开，无法发送消息。请等待重连后重试。'
-                        })
-                        failed_count += 1
-                        continue
-
-                    # 查找与买家的chat_id（优先从订单记录获取，回退到AI对话记录）
-                    chat_id = order.get('chat_id') or ''
-                    if not chat_id:
-                        chat_id = db_manager.find_chat_id_by_buyer(cookie_id, buyer_id)
-                    if not chat_id:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '未找到与该买家的聊天记录，无法发送卡券消息。请等待买家发送消息后重试。'
-                        })
-                        failed_count += 1
-                        continue
-
-                    protection_result = await live_instance.apply_delivery_block_rules(
-                        order_id=order_id,
-                        buyer_id=buyer_id,
-                        item_id=item_id,
-                        chat_id=chat_id,
-                        websocket=live_instance.ws,
-                        owner_id=user_id,
-                    )
-                    if protection_result["action"] == "block":
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': (
-                                f'发货已被规则“{protection_result["rule_name"]}”拦截：'
-                                f'{protection_result["reason"]}'
-                            )
-                        })
-                        failed_count += 1
-                        continue
-                    card_only_delivery = protection_result["action"] == "card_only"
-
-                    # 检查多数量发货
-                    quantity_to_send = 1
-                    order_detail = None
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(cookie_id, item_id)
-                    if multi_quantity_delivery:
                         try:
-                            order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
-                            if order_detail and isinstance(order_detail, dict):
-                                qty = int(order_detail.get('quantity') or 1)
-                                if qty > 1:
-                                    quantity_to_send = qty
+                            async with aiohttp.ClientSession(
+                                headers={'cookie': cookies_str},
+                                timeout=aiohttp.ClientTimeout(total=30)
+                            ) as session:
+                                confirm = SecureConfirm(session, cookies_str, cookie_id, None)
+                                confirm_result = await confirm.auto_confirm(order_id, item_id)
+
+                            if confirm_result and confirm_result.get('success'):
+                                attempt.sent()
+                                # 更新本地数据库状态
+                                db_manager.insert_or_update_order(
+                                    order_id=order_id,
+                                    order_status='shipped',
+                                    system_shipped=True
+                                )
+                                results.append({
+                                    'order_id': order_id,
+                                    'success': True,
+                                    'message': '已成功修改闲鱼发货状态'
+                                })
+                                success_count += 1
+                            else:
+                                error_msg = confirm_result.get('error', '未知错误') if confirm_result else '确认发货返回空结果'
+                                results.append({
+                                    'order_id': order_id,
+                                    'success': False,
+                                    'message': f'修改发货状态失败: {error_msg}'
+                                })
+                                failed_count += 1
                         except Exception as e:
-                            log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
+                            log_with_user('error', f"确认发货异常: {str(e)}", current_user)
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': f'确认发货异常: {str(e)}'
+                            })
+                            failed_count += 1
 
-                    # 获取卡券内容；确认发货必须在消息全部发送成功后执行。
-                    delivery_contents = []
-                    delivery_context = {}
-                    try:
-                        first_content = await live_instance._auto_delivery(
-                            item_id,
-                            '',
-                            order_id,
-                            buyer_id,
-                            order_detail=order_detail,
-                            delivery_context=delivery_context,
-                            requested_item_quantity=quantity_to_send,
+                    elif ship_mode == 'full_delivery':
+                        # ====== 完整发货流程：匹配卡券 + 发送卡券 + 修改状态 ======
+                        if not item_id:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '订单缺少商品ID，无法匹配发货规则'
+                            })
+                            failed_count += 1
+                            continue
+
+                        if not buyer_id:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '订单缺少买家ID，无法发送卡券'
+                            })
+                            failed_count += 1
+                            continue
+
+                        # 必须有运行中的实例（需要WebSocket发送消息）
+                        live_instance = XianyuLive.get_instance(cookie_id)
+                        if not live_instance:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '该账号未在线运行，无法执行完整发货。请先启动账号。'
+                            })
+                            failed_count += 1
+                            continue
+
+                        if not live_instance.ws or live_instance.ws.closed:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '该账号WebSocket连接已断开，无法发送消息。请等待重连后重试。'
+                            })
+                            failed_count += 1
+                            continue
+
+                        # 查找与买家的chat_id（优先从订单记录获取，回退到AI对话记录）
+                        chat_id = order.get('chat_id') or ''
+                        if not chat_id:
+                            chat_id = db_manager.find_chat_id_by_buyer(cookie_id, buyer_id)
+                        if not chat_id:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': '未找到与该买家的聊天记录，无法发送卡券消息。请等待买家发送消息后重试。'
+                            })
+                            failed_count += 1
+                            continue
+
+                        protection_result = await live_instance.apply_delivery_block_rules(
+                            order_id=order_id,
+                            buyer_id=buyer_id,
+                            item_id=item_id,
+                            chat_id=chat_id,
+                            websocket=live_instance.ws,
+                            owner_id=user_id,
                         )
-                    except Exception as e:
-                        log_with_user('error', f"获取第1个卡券失败: {str(e)}", current_user)
-                        first_content = None
+                        if protection_result["action"] == "block":
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': (
+                                    f'发货已被规则“{protection_result["rule_name"]}”拦截：'
+                                    f'{protection_result["reason"]}'
+                                )
+                            })
+                            failed_count += 1
+                            continue
+                        card_only_delivery = protection_result["action"] == "card_only"
 
-                    if first_content:
-                        delivery_contents.append(first_content)
-                        quantity_to_send *= max(
-                            1,
-                            int(delivery_context.get("delivery_count") or 1),
-                        )
+                        # 检查多数量发货
+                        quantity_to_send = 1
+                        order_detail = None
+                        multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(cookie_id, item_id)
+                        if multi_quantity_delivery:
+                            try:
+                                order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
+                                if order_detail and isinstance(order_detail, dict):
+                                    qty = int(order_detail.get('quantity') or 1)
+                                    if qty > 1:
+                                        quantity_to_send = qty
+                            except Exception as e:
+                                log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
 
-                    for i in range(1, quantity_to_send):
-                        if not delivery_contents:
-                            break
+                        # 获取卡券内容；确认发货必须在消息全部发送成功后执行。
+                        delivery_contents = []
+                        delivery_context = {"_delivery_websocket": live_instance.ws}
                         try:
-                            delivery_content = await live_instance._auto_delivery(
+                            first_content = await live_instance._auto_delivery(
                                 item_id,
                                 '',
                                 order_id,
                                 buyer_id,
                                 order_detail=order_detail,
                                 delivery_context=delivery_context,
-                            )
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
-                        except Exception as e:
-                            log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
-
-                    if not delivery_contents:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '未匹配到发货规则或卡券获取失败'
-                        })
-                        failed_count += 1
-                        continue
-
-                    # 发送卡券内容给买家
-                    sent_count = 0
-                    send_errors = []
-                    for idx, content in enumerate(delivery_contents):
-                        try:
-                            segment_count = await send_delivery_payload(
-                                live_instance,
-                                live_instance.ws,
-                                chat_id,
-                                buyer_id,
-                                content,
-                            )
-
-                            # 多条卡券之间间隔1秒；单条卡券内的分段间隔由发送器控制
-                            if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
-                                await asyncio.sleep(1)
-                            sent_count += 1
-                            log_with_user(
-                                'info',
-                                f"第{idx+1}条卡券已发送（{segment_count} 段消息）",
-                                current_user,
+                                requested_item_quantity=quantity_to_send,
                             )
                         except Exception as e:
-                            log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
-                            send_errors.append(f"第{idx + 1}条: {str(e)}")
+                            log_with_user('error', f"获取第1个卡券失败: {str(e)}", current_user)
+                            first_content = None
 
-                    acquired_all = len(delivery_contents) == quantity_to_send
-                    sent_all = sent_count == len(delivery_contents)
+                        if first_content:
+                            delivery_contents.append(first_content)
+                            quantity_to_send *= max(
+                                1,
+                                int(delivery_context.get("delivery_count") or 1),
+                            )
 
-                    if acquired_all and sent_all:
-                        confirm_required = (
-                            live_instance.is_auto_confirm_enabled()
-                            and not card_only_delivery
-                        )
-                        platform_confirmed = False
-                        confirm_error = None
-
-                        if confirm_required:
+                        for i in range(1, quantity_to_send):
+                            if not delivery_contents:
+                                break
                             try:
-                                confirm_result = await live_instance.auto_confirm(order_id, item_id)
-                                platform_confirmed = bool(confirm_result and confirm_result.get('success'))
-                                if platform_confirmed:
-                                    live_instance.confirmed_orders[order_id] = time.time()
-                                else:
-                                    confirm_error = (confirm_result or {}).get('error', '未知错误')
-                            except Exception as e:
-                                confirm_error = str(e)
-
-                        live_instance.mark_delivery_sent(order_id, update_order_status=platform_confirmed)
-                        update_values = {
-                            'order_id': order_id,
-                            'system_shipped': True
-                        }
-                        if platform_confirmed:
-                            update_values['order_status'] = 'shipped'
-                        db_manager.insert_or_update_order(**update_values)
-
-                        if card_only_delivery:
-                            results.append({
-                                'order_id': order_id,
-                                'success': True,
-                                'message': (
-                                    f'订单命中“{protection_result["rule_name"]}”并已关闭，'
-                                    f'仅发送{sent_count}条卡券信息'
+                                delivery_content = await live_instance._auto_delivery(
+                                    item_id,
+                                    '',
+                                    order_id,
+                                    buyer_id,
+                                    order_detail=order_detail,
+                                    delivery_context=delivery_context,
                                 )
-                            })
-                            success_count += 1
-                            continue
+                                if delivery_content:
+                                    delivery_contents.append(delivery_content)
+                            except Exception as e:
+                                log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
 
-                        if confirm_required and not platform_confirmed:
+                        if not delivery_contents:
                             results.append({
                                 'order_id': order_id,
                                 'success': False,
-                                'message': f'卡券已全部发送，但闲鱼确认发货失败，请手动确认：{confirm_error}'
+                                'message': '未匹配到发货规则或卡券获取失败'
                             })
                             failed_count += 1
                             continue
 
-                        results.append({
-                            'order_id': order_id,
-                            'success': True,
-                            'message': f'完整发货成功，已发送{sent_count}条卡券信息给买家'
-                        })
-                        success_count += 1
-                    else:
-                        live_instance.delivery_blocked_orders.add(order_id)
-                        live_instance.last_delivery_time[order_id] = time.time()
-                        detail = f'应发{quantity_to_send}条，获取{len(delivery_contents)}条，成功发送{sent_count}条'
-                        if send_errors:
-                            detail += f'；{"；".join(send_errors)}'
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': f'完整发货未完成：{detail}。已停止自动重试，请人工核对'
-                        })
-                        failed_count += 1
+                        attempt.prepared()
+                        # 发送卡券内容给买家
+                        sent_count = 0
+                        send_errors = []
+                        for idx, content in enumerate(delivery_contents):
+                            try:
+                                segment_count = await send_delivery_payload(
+                                    live_instance,
+                                    live_instance.ws,
+                                    chat_id,
+                                    buyer_id,
+                                    content,
+                                )
+
+                                # 多条卡券之间间隔1秒；单条卡券内的分段间隔由发送器控制
+                                if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
+                                    await asyncio.sleep(1)
+                                sent_count += 1
+                                log_with_user(
+                                    'info',
+                                    f"第{idx+1}条卡券已发送（{segment_count} 段消息）",
+                                    current_user,
+                                )
+                            except Exception as e:
+                                log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
+                                send_errors.append(f"第{idx + 1}条: {str(e)}")
+
+                        acquired_all = len(delivery_contents) == quantity_to_send
+                        sent_all = sent_count == len(delivery_contents)
+
+                        if acquired_all and sent_all:
+                            attempt.sent()
+                            confirm_required = (
+                                live_instance.is_auto_confirm_enabled()
+                                and not card_only_delivery
+                            )
+                            platform_confirmed = False
+                            confirm_error = None
+
+                            if confirm_required:
+                                try:
+                                    confirm_result = await live_instance.auto_confirm(order_id, item_id)
+                                    platform_confirmed = bool(confirm_result and confirm_result.get('success'))
+                                    if platform_confirmed:
+                                        live_instance.confirmed_orders[order_id] = time.time()
+                                    else:
+                                        confirm_error = (confirm_result or {}).get('error', '未知错误')
+                                except Exception as e:
+                                    confirm_error = str(e)
+
+                            live_instance.mark_delivery_sent(order_id, update_order_status=platform_confirmed)
+                            update_values = {
+                                'order_id': order_id,
+                                'system_shipped': True
+                            }
+                            if platform_confirmed:
+                                update_values['order_status'] = 'shipped'
+                            db_manager.insert_or_update_order(**update_values)
+
+                            if card_only_delivery:
+                                results.append({
+                                    'order_id': order_id,
+                                    'success': True,
+                                    'message': (
+                                        f'订单命中“{protection_result["rule_name"]}”并已关闭，'
+                                        f'仅发送{sent_count}条卡券信息'
+                                    )
+                                })
+                                success_count += 1
+                                continue
+
+                            if confirm_required and not platform_confirmed:
+                                results.append({
+                                    'order_id': order_id,
+                                    'success': False,
+                                    'message': f'卡券已全部发送，但闲鱼确认发货失败，请手动确认：{confirm_error}'
+                                })
+                                failed_count += 1
+                                continue
+
+                            results.append({
+                                'order_id': order_id,
+                                'success': True,
+                                'message': f'完整发货成功，已发送{sent_count}条卡券信息给买家'
+                            })
+                            success_count += 1
+                        else:
+                            live_instance.delivery_blocked_orders.add(order_id)
+                            live_instance.last_delivery_time[order_id] = time.time()
+                            detail = f'应发{quantity_to_send}条，获取{len(delivery_contents)}条，成功发送{sent_count}条'
+                            if send_errors:
+                                detail += f'；{"；".join(send_errors)}'
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': f'完整发货未完成：{detail}。已停止自动重试，请人工核对'
+                            })
+                            failed_count += 1
 
             except Exception as e:
                 results.append({

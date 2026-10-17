@@ -260,6 +260,9 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_card_shipments_user_time "
                 "ON card_shipments(user_id, id DESC)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_card_shipments_order ON card_shipments(order_id)"
+            )
 
             # 创建订单表
             cursor.execute('''
@@ -289,6 +292,17 @@ class DBManager:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS order_delivery_attempts (
+                order_id TEXT PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                state TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'ready',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
 
@@ -5482,6 +5496,12 @@ class DBManager:
                     ''', (card_id, card_name, content, order_id or '', item_id or '',
                           buyer_id or '', cookie_id or '', card_user_id))
 
+                # Persist the uncertain-delivery boundary in the same transaction as stock.
+                cursor.execute("""
+                    UPDATE order_delivery_attempts SET phase='prepared', updated_at=CURRENT_TIMESTAMP
+                    WHERE order_id=? AND state='active'
+                """, (order_id,))
+
                 self.conn.commit()
 
                 logger.info(
@@ -7425,7 +7445,7 @@ class DBManager:
                 # 先尝试查询包含version的订单
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id, system_shipped
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -7447,7 +7467,8 @@ class DBManager:
                         'created_at': row[10],
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else ''
+                        'chat_id': row[13] if len(row) > 13 else '',
+                        'system_shipped': bool(row[14])
                     }
                 return None
 
