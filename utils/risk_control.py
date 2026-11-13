@@ -14,6 +14,7 @@
 """
 
 import asyncio
+import threading
 import time
 from typing import Dict
 
@@ -58,7 +59,9 @@ class AccountGuard:
         # 令牌桶：容量等于每分钟配额，按秒匀速补充
         self._tokens = float(self.rate_per_minute)
         self._last_refill = time.monotonic()
-        self._lock = asyncio.Lock()
+        # HTTP 线程与账号监听循环共用 guard，不能共享 asyncio.Lock。
+        # 仅在短小的令牌计算期间持锁，等待必须放在锁外。
+        self._lock = threading.Lock()
 
     # ---------------- 熔断 ----------------
 
@@ -95,8 +98,8 @@ class AccountGuard:
 
     async def acquire(self) -> None:
         """取一个令牌，不足时等待。"""
-        async with self._lock:
-            while True:
+        while True:
+            with self._lock:
                 now = time.monotonic()
                 elapsed = now - self._last_refill
                 self._last_refill = now
@@ -107,8 +110,8 @@ class AccountGuard:
                 if self._tokens >= 1:
                     self._tokens -= 1
                     return
-                # 补足一个令牌所需的时间
-                await asyncio.sleep((1 - self._tokens) * (60.0 / self.rate_per_minute))
+                wait = (1 - self._tokens) * (60.0 / self.rate_per_minute)
+            await asyncio.sleep(wait)
 
     def snapshot(self) -> Dict[str, object]:
         return {
@@ -126,16 +129,20 @@ class RiskControlRegistry:
     def __init__(self, rate_per_minute: int = 30):
         self.rate_per_minute = rate_per_minute
         self._guards: Dict[str, AccountGuard] = {}
+        self._lock = threading.Lock()
 
     def get(self, cookie_id: str) -> AccountGuard:
-        guard = self._guards.get(cookie_id)
-        if guard is None:
-            guard = AccountGuard(cookie_id, self.rate_per_minute)
-            self._guards[cookie_id] = guard
-        return guard
+        with self._lock:
+            guard = self._guards.get(cookie_id)
+            if guard is None:
+                guard = AccountGuard(cookie_id, self.rate_per_minute)
+                self._guards[cookie_id] = guard
+            return guard
 
     def snapshot(self) -> Dict[str, Dict[str, object]]:
-        return {cid: guard.snapshot() for cid, guard in self._guards.items()}
+        with self._lock:
+            guards = list(self._guards.items())
+        return {cid: guard.snapshot() for cid, guard in guards}
 
 
 class RiskControlBlocked(Exception):

@@ -134,13 +134,19 @@ async def launch_browser(
     """
     semaphore = _get_semaphore()
 
-    # 在线程里等待，避免占着事件循环不放导致消息收发一起卡住
-    acquired = await asyncio.to_thread(semaphore.acquire, True, _ACQUIRE_TIMEOUT)
-    if not acquired:
-        raise TimeoutError(
-            f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
-            "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
-        )
+    # 不在线程池里阻塞 acquire：协程取消不会停止线程，后台线程稍后取到
+    # 槽位后将再也没有归还方。非阻塞取槽与下面的 try 之间没有 await，
+    # 因此取消只能发生在等待期间（未占槽）或 try 内（负责归还）。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _ACQUIRE_TIMEOUT
+    while not semaphore.acquire(blocking=False):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
+                "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
+            )
+        await asyncio.sleep(min(0.1, remaining))
 
     try:
         browser = await playwright.chromium.launch(**(launch_options or {}))

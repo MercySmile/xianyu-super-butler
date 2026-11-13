@@ -191,8 +191,12 @@ async def sync_account_orders(
         "expected": None,
         "complete": True,
         "cookies_str": cookies_str,
+        "success": True,
+        "session_expired": False,
+        "error": None,
     }
     if not cookies_str:
+        result.update(success=False, complete=False, failed=1, error='账号Cookie为空')
         return result
 
     from app.db_manager import db_manager
@@ -206,8 +210,20 @@ async def sync_account_orders(
         try:
             items = await api.iter_sold_orders(rows_per_page=50)
         except SellerApiError as exc:
+            if not exc.retryable:
+                raise
             logger.warning(f"【{cookie_id}】卖出订单拉取失败: {exc}")
+            result['success'] = False
+            result['complete'] = False
+            result['failed'] += 1
+            result['error'] = str(exc)
             items = []
+
+        if api.failed_pages:
+            result['success'] = False
+            result['complete'] = False
+            result['failed'] += len(api.failed_pages)
+            result['error'] = f'部分订单页拉取失败: {api.failed_pages}'
 
         seen = set()
         for item in items:
@@ -241,7 +257,13 @@ async def sync_account_orders(
             try:
                 refunds = await api.iter_refund_orders(rows_per_page=50)
             except SellerApiError as exc:
+                if not exc.retryable:
+                    raise
                 logger.warning(f"【{cookie_id}】退款单拉取失败: {exc}")
+                result['success'] = False
+                result['complete'] = False
+                result['failed'] += 1
+                result['error'] = str(exc)
                 refunds = []
 
             for item in refunds:
@@ -266,8 +288,14 @@ async def sync_account_orders(
         # 接口会下发新的签名令牌，回传给调用方以便同步到账号会话
         result["cookies_str"] = api.cookies_str
     except Exception as e:
+        result['success'] = False
+        result['complete'] = False
+        result['failed'] += 1
+        result['error'] = str(e)
+        result['session_expired'] = isinstance(e, SellerApiError) and e.session_expired
         logger.error(f"【{cookie_id}】卖出订单同步异常: {e}")
     finally:
+        result['cookies_str'] = api.cookies_str
         await api.close()
 
     logger.info(
@@ -276,7 +304,10 @@ async def sync_account_orders(
         f"成功 {result['saved']}，失败 {result['failed']}"
         + ("" if result["complete"] else f"，⚠️ 少于服务端角标 {result['expected']}")
     )
-    if result["pending_order_ids"]:
+    if result['failed']:
+        result['success'] = False
+        result['complete'] = False
+    if result["pending_order_ids"] and not result['session_expired']:
         from app.delivery_reconciliation import request_delivery_reconciliation
         request_delivery_reconciliation(cookie_id, result["pending_order_ids"], source="order_sync")
     return result

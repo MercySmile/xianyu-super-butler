@@ -63,6 +63,28 @@ class CookieTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(restarted, completed)
         self.assertEqual(self.manager.get_task_state("account-1"), "running")
 
+    async def test_watchdog_recovers_with_persisted_latest_cookie(self):
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        self.manager.tasks['account-1'] = finished
+        self.manager.cookies['account-1'] = 'stale-cookie'
+        self.db.get_cookie_details.return_value = {'value': 'latest-cookie', 'user_id': 7}
+        with patch('app.cookie_manager.asyncio.sleep', new_callable=AsyncMock):
+            await self.manager._recover_stopped_listener('account-1', finished)
+        self.assertEqual('latest-cookie', self.manager.cookies['account-1'])
+        self.assertEqual('running', self.manager.get_task_state('account-1'))
+
+    async def test_watchdog_does_not_resurrect_disabled_or_replaced_listener(self):
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        self.manager.tasks['account-1'] = finished
+        self.manager.cookies['account-1'] = 'cookie'
+        self.manager.cookie_status['account-1'] = False
+        with patch('app.cookie_manager.asyncio.sleep', new_callable=AsyncMock):
+            await self.manager._recover_stopped_listener('account-1', finished)
+        self.assertIs(finished, self.manager.tasks['account-1'])
+        self.db.get_cookie_details.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

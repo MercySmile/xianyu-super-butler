@@ -350,6 +350,39 @@ class DeliveryRecoveryTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
         self.fetch.assert_not_awaited()
         self.assertEqual(0, self.shipment_count())
 
+    async def test_relogin_then_reconciliation_sends_grouped_bundle_once(self):
+        from app.card_inventory import join_card_inventory
+        from XianyuAutoAsync import ConnectionState
+        self.live.connection_state = ConnectionState.CONNECTED
+        units = ['Username: first\nPassword: one', 'Username: second\nPassword: two']
+        stock = self.db.create_card('grouped', 'grouped_data', user_id=1,
+                                    data_content=join_card_inventory('grouped_data', units))
+        self.db.save_item_delivery_config(1, 'seller', 'item', True, True, [
+            {'display_name': '账号和下载器', 'spec_text': '类型=账号和下载器', 'card_id': stock,
+             'delivery_count': 1, 'fixed_text_card_ids': [self.text]},
+        ])
+        self.details['100'] = self.detail('100', '账号和下载器')
+        self.live._mark_relogin_required('expired')
+        await reconcile_pending_deliveries(self.live, ['100'])
+        self.fetch.assert_not_awaited()
+        self.assertEqual(0, self.shipment_count())
+        # The actual recovery method used after successful Token authentication.
+        self.live._clear_relogin_required()
+        await reconcile_pending_deliveries(self.live, ['100'])
+        await reconcile_pending_deliveries(self.live, ['100'])
+        self.assertEqual([units[0] + '\n\nDownload guide'], self.sent_texts())
+        self.assertEqual(1, self.shipment_count())
+        self.assertEqual(units[1], self.db.get_card_by_id(stock)['data_content'])
+
+    async def test_authentication_fails_during_order_lookup_does_not_consume(self):
+        async def lookup(*args, **kwargs):
+            self.live.authentication_pending = True
+            return self.detail('100')
+        self.fetch.side_effect = lookup
+        await reconcile_pending_deliveries(self.live, ['100'])
+        self.assertEqual(0, self.shipment_count())
+        self.assertEqual([], self.sent_texts())
+
     async def test_connection_change_during_preparation_prevents_stock_consumption(self):
         async def close_during_preparation(*args):
             self.live.ws.closed = True
@@ -422,7 +455,7 @@ class DeliveryRecoveryTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
         api = SimpleNamespace(
             get_expected_order_total=AsyncMock(return_value=2),
             iter_sold_orders=AsyncMock(return_value=[self.detail('100'), self.detail('101', status='shipped', status_text='已发货')]),
-            cookies_str='cookie', close=AsyncMock(),
+            cookies_str='cookie', close=AsyncMock(), failed_pages=[],
         )
         with patch('utils.seller_order_sync.XianyuSellerAPI', return_value=api), \
              patch('utils.seller_order_sync.parse_sold_order', side_effect=lambda value: value), \

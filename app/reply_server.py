@@ -1343,6 +1343,9 @@ def _is_account_connection_alive(instance) -> bool:
     只看 connection_state 不够：状态是 CONNECTED 但连接对象已被对端关闭时
     （浏览器标签页长时间挂后台会出现这种"半开"），请求仍会一路等到超时。
     """
+    if (getattr(instance, 'needs_relogin', False)
+            or getattr(instance, 'authentication_pending', False)):
+        return False
     state = getattr(instance, 'connection_state', None)
     state_value = getattr(state, 'value', state)
     if state_value != 'connected':
@@ -9233,6 +9236,9 @@ async def sync_sold_orders(
         if not res['complete']:
             summary['incomplete_accounts'].append(cid)
         summary['accounts'][cid] = {
+            'success': res.get('success', not res['failed']),
+            'error': res.get('error'),
+            'session_expired': res.get('session_expired', False),
             'total': res['total'],
             'saved': res['saved'],
             'failed': res['failed'],
@@ -9257,7 +9263,9 @@ async def sync_sold_orders(
         message += f"；部分账号可能未拉全: {', '.join(summary['incomplete_accounts'])}"
 
     return JSONResponse({
-        'success': True,
+        'success': not summary['failed'] and not any(
+            entry.get('error') for entry in summary['accounts'].values()
+        ),
         'message': message,
         'summary': summary,
     })

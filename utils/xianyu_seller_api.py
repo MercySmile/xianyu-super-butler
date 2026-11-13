@@ -21,6 +21,7 @@ import aiohttp
 from loguru import logger
 
 from utils import risk_control
+from utils.auth_errors import is_session_expired, is_token_expired
 from utils.xianyu_utils import generate_sign, trans_cookies
 from utils.user_agents import CHROME_UA
 
@@ -39,6 +40,14 @@ class SellerApiError(Exception):
         self.api = api
         self.ret = ret
         super().__init__(f"{api} 调用失败: {'; '.join(ret) if ret else '未知错误'}")
+
+    @property
+    def session_expired(self) -> bool:
+        return is_session_expired(self.ret)
+
+    @property
+    def retryable(self) -> bool:
+        return not self.session_expired and not risk_control.is_risk_control_error(self.ret)
 
 
 class XianyuSellerAPI:
@@ -71,6 +80,20 @@ class XianyuSellerAPI:
         self.cookies_str = cookies_str or ""
         self._session = session
         self._owns_session = session is None
+        self._session_failure = None
+        self.failed_pages = []
+
+    def _request_session_recovery(self):
+        # This client may run on the HTTP loop. Cookie/WS recovery belongs to the
+        # registered listener loop, never to a temporary profile or QR helper.
+        from XianyuAutoAsync import XianyuLive
+        live = XianyuLive.get_instance(self.cookie_id)
+        loop = getattr(live, '_listener_loop', None)
+        if live and loop and loop.is_running() and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(live._schedule_session_recovery)
+            except RuntimeError:
+                pass
 
     async def __aenter__(self) -> "XianyuSellerAPI":
         await self._ensure_session()
@@ -93,6 +116,7 @@ class XianyuSellerAPI:
 
     def update_cookies(self, cookies_str: str) -> None:
         self.cookies_str = cookies_str or ""
+        self._session_failure = None
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -134,6 +158,8 @@ class XianyuSellerAPI:
         """
         if not self.cookies_str:
             raise SellerApiError(api, ["Cookie 为空，无法调用卖家端接口"])
+        if self._session_failure:
+            raise self._session_failure
 
         last_ret: List[str] = []
         # 熔断：账号处于风控冷却期时直接放弃，继续请求只会延长风控
@@ -186,18 +212,18 @@ class XianyuSellerAPI:
 
             last_ret = ret_list
 
+            if is_session_expired(ret_list):
+                self._session_failure = SellerApiError(api, ret_list)
+                self._request_session_recovery()
+                raise self._session_failure
+
             # 平台风控：立刻熔断，不重试
             if risk_control.is_risk_control_error("; ".join(ret_list)):
                 guard.trip("; ".join(ret_list))
                 raise SellerApiError(api, ret_list)
 
             # 服务端对令牌过期有两种拼写，且历史版本存在拼写错误（EXOIRED）
-            token_expired = any(
-                "TOKEN_EXPIRED" in value
-                or "TOKEN_EXOIRED" in value
-                or "FAIL_SYS_TOKEN_EMPTY" in value
-                for value in ret_list
-            )
+            token_expired = is_token_expired(ret_list)
             if not token_expired or attempt == 1:
                 break
             logger.debug(f"【{self.cookie_id}】{api} 令牌过期，使用新令牌重试")
@@ -288,6 +314,7 @@ class XianyuSellerAPI:
         collected: List[Dict[str, Any]] = []
         seen_ids = set()
         failed_pages = []
+        self.failed_pages = failed_pages
         for page in range(1, max_pages + 1):
             batch = None
             for attempt in range(3):
@@ -300,6 +327,8 @@ class XianyuSellerAPI:
                     )
                     break
                 except SellerApiError as exc:
+                    if not exc.retryable:
+                        raise
                     if attempt == 2:
                         logger.warning(
                             f"【{self.cookie_id}】第 {page} 页拉取失败（已重试 3 次）: {exc}"
@@ -400,6 +429,8 @@ class XianyuSellerAPI:
         try:
             counts = await self.get_order_count("ORDER")
         except SellerApiError as exc:
+            if not exc.retryable:
+                raise
             logger.debug(f"【{self.cookie_id}】读取订单角标失败: {exc}")
             return None
         return counts.get("ALL")

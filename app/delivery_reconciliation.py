@@ -61,6 +61,8 @@ def _online(live):
     from app.cookie_manager import manager
     from utils import risk_control
     return (XianyuLive.get_instance(live.cookie_id) is live
+            and not getattr(live, 'needs_relogin', False)
+            and not getattr(live, 'authentication_pending', False)
             and bool(live.ws) and not live.ws.closed
             and (not manager or manager.get_cookie_status(live.cookie_id))
             and not risk_control.registry.get(live.cookie_id).is_blocked)

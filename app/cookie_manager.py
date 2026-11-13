@@ -93,6 +93,7 @@ class CookieManager:
                 sys.stdout.flush()
             except:
                 pass
+            raise
         except Exception as e:
             logger.error(f"【{cookie_id}】XianyuLive 任务异常: {e}")
             import traceback
@@ -132,8 +133,27 @@ class CookieManager:
             else:
                 logger.warning(f"【{cookie_id}】账号监听任务已退出，可重新登录或启用账号以重启")
 
+            if self.tasks.get(cookie_id) is done_task:
+                self.loop.create_task(self._recover_stopped_listener(cookie_id, done_task))
+
         task.add_done_callback(_on_done)
         return task
+
+    async def _recover_stopped_listener(self, cookie_id, stopped_task):
+        """Recover an unexpected listener exit; explicit cancellation stays stopped."""
+        await asyncio.sleep(5)
+        if (self.tasks.get(cookie_id) is not stopped_task
+                or cookie_id not in self.cookies
+                or not self.cookie_status.get(cookie_id, True)):
+            return
+        info = await asyncio.to_thread(db_manager.get_cookie_details, cookie_id)
+        if not info or not info.get('value'):
+            return
+        try:
+            logger.warning(f"【{cookie_id}】监听异常退出，使用最新Cookie自动恢复")
+            await self._ensure_cookie_task_async(cookie_id, info['value'], user_id=info.get('user_id'))
+        except Exception as exc:
+            logger.error(f"【{cookie_id}】自动恢复监听失败: {type(exc).__name__}")
 
     async def _ensure_cookie_task_async(
         self,
@@ -305,6 +325,8 @@ class CookieManager:
             # 必须与普通重连区分开，否则界面只显示「连接中」，用户会一直等。
             if getattr(instance, 'needs_relogin', False):
                 return "need_relogin"
+            if getattr(instance, 'authentication_pending', False):
+                return "connecting"
             state = getattr(instance, 'connection_state', None)
             state_value = getattr(state, 'value', state)
             if state_value in ('failed', 'closed'):
