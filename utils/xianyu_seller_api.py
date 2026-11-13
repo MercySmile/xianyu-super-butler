@@ -90,8 +90,13 @@ class XianyuSellerAPI:
         live = XianyuLive.get_instance(self.cookie_id)
         loop = getattr(live, '_listener_loop', None)
         if live and loop and loop.is_running() and not loop.is_closed():
+            rejected_session = trans_cookies(self.cookies_str).get('cookie2')
+            def recover_current_listener():
+                if (XianyuLive.get_instance(self.cookie_id) is live
+                        and live.cookies.get('cookie2') == rejected_session):
+                    live._schedule_session_recovery()
             try:
-                loop.call_soon_threadsafe(live._schedule_session_recovery)
+                loop.call_soon_threadsafe(recover_current_listener)
             except RuntimeError:
                 pass
 

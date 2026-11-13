@@ -383,6 +383,15 @@ class DeliveryRecoveryTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.shipment_count())
         self.assertEqual([], self.sent_texts())
 
+    async def test_authentication_fails_during_rule_check_does_not_consume(self):
+        async def check(**kwargs):
+            self.live.authentication_pending = True
+            return {'action': 'allow'}
+        self.live.apply_delivery_block_rules.side_effect = check
+        await reconcile_pending_deliveries(self.live, ['100'])
+        self.assertEqual(0, self.shipment_count())
+        self.assertEqual([], self.sent_texts())
+
     async def test_connection_change_during_preparation_prevents_stock_consumption(self):
         async def close_during_preparation(*args):
             self.live.ws.closed = True

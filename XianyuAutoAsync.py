@@ -361,6 +361,7 @@ class XianyuLive:
             updated = (info or {}).get('value', '')
             if updated and updated != self.cookies_str:
                 self.cookies_str = updated
+                self._stored_cookie_value = updated
                 self.cookies = trans_cookies(updated)
                 self._clear_relogin_required()
                 self.current_token = None
@@ -891,6 +892,7 @@ class XianyuLive:
 
         self.cookie_id = cookie_id  # 唯一账号标识
         self.cookies_str = cookies_str  # 保存原始cookie字符串
+        self._stored_cookie_value = cookies_str
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
         self.base_url = WEBSOCKET_URL
 
@@ -2354,9 +2356,10 @@ class XianyuLive:
                     )
                     if account_info and account_info.get('value'):
                         new_cookies_str = account_info.get('value')
-                        if new_cookies_str != self.cookies_str:
+                        if new_cookies_str != self._stored_cookie_value:
                             logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                             self.cookies_str = new_cookies_str
+                            self._stored_cookie_value = new_cookies_str
                             # 更新cookies字典
                             self.cookies = trans_cookies(self.cookies_str)
                             logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
@@ -2470,7 +2473,9 @@ class XianyuLive:
                             # 生成新的cookie字符串
                             self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
                             # 更新数据库中的Cookie
-                            await self.update_config_cookies()
+                            if not await self.update_config_cookies():
+                                self.last_token_refresh_status = 'cookie_persistence_failed'
+                                return None
                             logger.warning("已更新Cookie到数据库")
 
                     if isinstance(res_json, dict):
@@ -3144,10 +3149,13 @@ class XianyuLive:
         from app.db_manager import db_manager
         try:
             async with self._cookie_persist_lock:
+                pending_value = self.cookies_str
                 success = await asyncio.to_thread(
-                    db_manager.update_cookie_account_info, self.cookie_id,
-                    cookie_value=self.cookies_str, user_id=self.user_id,
+                    db_manager.refresh_cookie_value, self.cookie_id,
+                    self._stored_cookie_value, pending_value,
                 )
+                if success:
+                    self._stored_cookie_value = pending_value
             if not success:
                 logger.error(f"【{self.cookie_id}】Cookie持久化失败")
             return bool(success)
@@ -3163,10 +3171,11 @@ class XianyuLive:
             self._mark_relogin_required('无法读取账号凭据，请检查账号设置并重新登录')
             return False
         updated = info.get('value', '')
-        if updated and updated != self.cookies_str:
+        if updated and updated != self._stored_cookie_value:
             parsed = trans_cookies(updated)
             if str(parsed.get('unb') or '') == str(self.myid):
                 self.cookies_str = updated
+                self._stored_cookie_value = updated
                 self.cookies = parsed
                 return True
         username, password = info.get('username'), info.get('password')
@@ -6586,9 +6595,9 @@ class XianyuLive:
                                 break
                             # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
                             if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):
-                                logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试")
+                                logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{min(self.token_retry_interval, 60)}秒后重试")
                             else:
-                                logger.error(f"【{self.cookie_id}】Token刷新失败，将在{self.token_retry_interval // 60}分钟后重试")
+                                logger.error(f"【{self.cookie_id}】Token刷新失败，将在{min(self.token_retry_interval, 60)}秒后重试")
 
                             # 网络异常继续保留现有监听；短间隔重试续期。
                             # 真正Session失效已在上面进入认证恢复或人工重登。

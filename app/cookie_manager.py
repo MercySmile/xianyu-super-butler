@@ -146,10 +146,11 @@ class CookieManager:
                 or cookie_id not in self.cookies
                 or not self.cookie_status.get(cookie_id, True)):
             return
-        info = await asyncio.to_thread(db_manager.get_cookie_details, cookie_id)
-        if not info or not info.get('value'):
-            return
         try:
+            info = await asyncio.to_thread(db_manager.get_cookie_details, cookie_id)
+            if (not info or not info.get('value') or self.tasks.get(cookie_id) is not stopped_task
+                    or cookie_id not in self.cookies or not self.cookie_status.get(cookie_id, True)):
+                return
             logger.warning(f"【{cookie_id}】监听异常退出，使用最新Cookie自动恢复")
             await self._ensure_cookie_task_async(cookie_id, info['value'], user_id=info.get('user_id'))
         except Exception as exc:

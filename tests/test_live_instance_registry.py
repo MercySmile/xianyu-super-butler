@@ -100,7 +100,8 @@ class LiveInstanceRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.helper()
             self.assertIs(XianyuLive.get_instance(ACCOUNT), live)
             task.cancel()
-            await task
+            with self.assertRaises(asyncio.CancelledError):
+                await task
             self.assertNotIn(ACCOUNT, manager.instances)
             self.assertIsNone(XianyuLive.get_instance(ACCOUNT))
 

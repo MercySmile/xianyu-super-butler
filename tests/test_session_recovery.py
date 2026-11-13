@@ -1,5 +1,7 @@
 """Use real recovery methods with fake platform responses; never log into a real account."""
 import asyncio
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -145,11 +147,10 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         from app.db_manager import db_manager
         self.db = db_manager
         self.db.get_cookie_details.return_value = {'value': COOKIES, 'username': '', 'password': ''}
-        self.db.update_cookie_account_info.return_value = True
-        def persist(_cookie_id, *, cookie_value, user_id):
-            self.db.get_cookie_details.return_value['value'] = cookie_value
+        def persist(_cookie_id, expected_value, new_value):
+            self.db.get_cookie_details.return_value['value'] = new_value
             return True
-        self.db.update_cookie_account_info.side_effect = persist
+        self.db.refresh_cookie_value.side_effect = persist
         self.live = XianyuLive(COOKIES, '123', 1)
         self.live.ws = SimpleNamespace(closed=False, close=AsyncMock(), send=AsyncMock())
         self.live.connection_state = ConnectionState.CONNECTED
@@ -212,8 +213,7 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.live._try_password_login_refresh())
         self.assertEqual('renewed', self.live.cookies['cookie2'])
         self.live._restart_instance.assert_not_awaited()
-        self.assertEqual({'cookie_value': self.live.cookies_str, 'user_id': 1},
-                         self.db.update_cookie_account_info.call_args.kwargs)
+        self.assertEqual(('123', COOKIES, self.live.cookies_str), self.db.refresh_cookie_value.call_args.args)
 
     async def test_password_login_failure_limit_survives_retry_attempts(self):
         self.db.get_cookie_details.return_value = {'value': COOKIES, 'username': 'user', 'password': 'bad'}
@@ -261,14 +261,14 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         entered, release = threading.Event(), threading.Event()
         writes = []
 
-        def persist(_cookie_id, *, cookie_value, user_id):
+        def persist(_cookie_id, expected_value, new_value):
             if not writes:
                 entered.set()
                 release.wait(timeout=2)
-            writes.append(cookie_value)
+            writes.append(new_value)
             return True
 
-        self.db.update_cookie_account_info.side_effect = persist
+        self.db.refresh_cookie_value.side_effect = persist
         first = asyncio.create_task(self.live.update_config_cookies())
         await asyncio.to_thread(entered.wait, 1)
         self.live.cookies_str = COOKIES.replace('session', 'latest')
@@ -458,6 +458,33 @@ class SellerFailureTests(unittest.IsolatedAsyncioTestCase):
                     await api.get_order_count()
         recover.assert_called_once()
         self.assertEqual(1, len(session.requests))
+
+
+class CookiePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        from app.db_manager import DBManager
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = DBManager(os.path.join(self.temp.name, 'session.db'))
+        self.db.save_cookie('123', COOKIES, user_id=1)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def test_refresh_preserves_credentials_and_refuses_to_overwrite_new_scan(self):
+        self.db.update_cookie_account_info('123', username='seller', password='pass')
+        self.assertTrue(self.db.refresh_cookie_value('123', COOKIES, 'refreshed'))
+        self.db.update_cookie_account_info('123', cookie_value='new-scan')
+        self.assertFalse(self.db.refresh_cookie_value('123', 'refreshed', 'stale-background-result'))
+        info = self.db.get_cookie_details('123')
+        self.assertEqual('new-scan', info['value'])
+        self.assertEqual('seller', info['username'])
+        self.assertEqual('pass', info['password'])
+
+    def test_deleted_account_cannot_be_recreated_by_late_refresh(self):
+        self.db.delete_cookie('123')
+        self.assertFalse(self.db.refresh_cookie_value('123', COOKIES, 'late-refresh'))
+        self.assertIsNone(self.db.get_cookie_details('123'))
 
 
 if __name__ == '__main__':

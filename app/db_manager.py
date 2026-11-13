@@ -2384,6 +2384,15 @@ class DBManager:
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
+    def refresh_cookie_value(self, cookie_id: str, expected_value: str, new_value: str) -> bool:
+        """Only replace the session that was refreshed; never overwrite a newer scan or recreate a deleted account."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('UPDATE cookies SET value = ? WHERE id = ? AND value = ?',
+                           (new_value, cookie_id, expected_value))
+            self.conn.commit()
+            return cursor.rowcount == 1
+
     def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
@@ -4148,6 +4157,22 @@ class DBManager:
         except Exception as e:
             # 升级失败不阻塞登录，保留旧哈希下次再试
             logger.warning(f"密码哈希升级失败（不影响本次登录）: {username} - {e}")
+
+    def update_username(self, old_username: str, new_username: str) -> bool:
+        """修改用户登录名（users.username 有 UNIQUE 约束，调用前应先查重）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('UPDATE users SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?', (new_username, old_username))
+                self.conn.commit()
+                if cursor.rowcount == 0:
+                    logger.warning(f"修改用户名失败: 未找到用户 {old_username}")
+                    return False
+                logger.info(f"用户名修改成功: {old_username} -> {new_username}")
+                return True
+            except Exception as e:
+                logger.error(f"修改用户名异常: {e}")
+                return False
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
