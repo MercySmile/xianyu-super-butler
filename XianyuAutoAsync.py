@@ -360,13 +360,15 @@ class XianyuLive:
             info = await asyncio.to_thread(db_manager.get_cookie_details, self.cookie_id)
             updated = (info or {}).get('value', '')
             if updated and updated != self.cookies_str:
-                self.cookies_str = updated
-                self._stored_cookie_value = updated
-                self.cookies = trans_cookies(updated)
-                self._clear_relogin_required()
-                self.current_token = None
-                self.last_token_refresh_time = 0
-                break
+                parsed = trans_cookies(updated)
+                if str(parsed.get('unb') or '') == str(self.myid):
+                    self.cookies_str = updated
+                    self._stored_cookie_value = updated
+                    self.cookies = parsed
+                    self._clear_relogin_required()
+                    self.current_token = None
+                    self.last_token_refresh_time = 0
+                    break
             await self._interruptible_sleep(5)
 
         self.connection_failures = 0
@@ -2261,12 +2263,14 @@ class XianyuLive:
         """Must be called on the listener loop; simultaneous failures share one recovery."""
         if self.needs_relogin:
             return
+        # Every confirmed seller-session failure must pause inventory consumption,
+        # including failures arriving during the recovery cooldown.
+        self.authentication_pending = True
         existing = self._session_recovery_task
         if existing and not existing.done():
             return
         if time.time() - self._last_session_recovery_time < 60:
             return
-        self.authentication_pending = True
         self._last_session_recovery_time = time.time()
         self._session_recovery_task = self._create_tracked_task(self._recover_business_session())
 
@@ -2357,11 +2361,16 @@ class XianyuLive:
                     if account_info and account_info.get('value'):
                         new_cookies_str = account_info.get('value')
                         if new_cookies_str != self._stored_cookie_value:
+                            parsed = trans_cookies(new_cookies_str)
+                            if str(parsed.get('unb') or '') != str(self.myid):
+                                self._mark_relogin_required('保存的Cookie与当前账号不匹配，请重新登录当前账号')
+                                await self._notify_relogin_required()
+                                return None
                             logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                             self.cookies_str = new_cookies_str
                             self._stored_cookie_value = new_cookies_str
                             # 更新cookies字典
-                            self.cookies = trans_cookies(self.cookies_str)
+                            self.cookies = parsed
                             logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
             except Exception as reload_e:
                 logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
@@ -3227,7 +3236,8 @@ class XianyuLive:
             try:
                 await api.get_order_count()
                 self._merge_cookie_snapshot(api.cookies_str, baseline)
-                await self.update_config_cookies()
+                if not await self.update_config_cookies():
+                    return {'valid': False, 'session_expired': False, 'details': 'Cookie持久化失败，未确认续期完成'}
                 return {'valid': True, 'session_expired': False, 'details': '卖家订单接口认证通过'}
             except SellerApiError as exc:
                 return {'valid': False, 'session_expired': exc.session_expired,
@@ -6578,15 +6588,17 @@ class XianyuLive:
                             if self.ws and not self.ws.closed:
                                 try:
                                     logger.info(f"【{self.cookie_id}】关闭当前WebSocket连接以使用新Token重连...")
-                                    await self.ws.close()
+                                    await asyncio.wait_for(self.ws.close(), timeout=5)
                                     logger.info(f"【{self.cookie_id}】WebSocket连接已关闭，将自动重连")
                                 except Exception as close_e:
                                     logger.warning(f"【{self.cookie_id}】关闭WebSocket时出错: {self._safe_str(close_e)}")
                             
-                            # 退出Token刷新循环，让main循环重新建立连接
-                            # 后台任务（心跳、清理等）继续运行
-                            logger.info(f"【{self.cookie_id}】Token刷新完成，WebSocket将使用新Token重新连接")
-                            break
+                            # Main can reconnect before close() returns. Keep this
+                            # worker alive: otherwise main may see it still running,
+                            # skip replacement, then lose renewal when it exits.
+                            logger.info(f"【{self.cookie_id}】Token刷新完成，刷新循环继续保活并等待下次续期")
+                            await self._interruptible_sleep(60)
+                            continue
                         else:
                             if self.needs_relogin:
                                 await self._notify_relogin_required()
@@ -8823,7 +8835,8 @@ class XianyuLive:
             )
 
             # 更新数据库中的Cookie
-            await self.update_config_cookies()
+            if not await self.update_config_cookies():
+                return False
 
             # 只有当由refresh_token触发时才设置浏览器Cookie刷新成功标志
             if triggered_by_refresh_token:

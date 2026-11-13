@@ -312,6 +312,60 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.live.refresh_token.assert_awaited_once()
         self.live.ws.close.assert_awaited_once()
 
+    async def test_session_failure_during_recovery_cooldown_still_blocks_stock(self):
+        self.live._last_session_recovery_time = time.time()
+        self.live.authentication_pending = False
+        self.live._schedule_session_recovery()
+        self.assertTrue(self.live.authentication_pending)
+        self.assertIsNone(self.live._session_recovery_task)
+
+    async def test_token_refresh_worker_survives_two_websocket_reconnections(self):
+        sockets = []
+
+        async def reconnect():
+            ws = SimpleNamespace(closed=False, close=AsyncMock(side_effect=reconnect))
+            sockets.append(ws)
+            self.live.ws = ws
+
+        await reconnect()
+        self.live.refresh_token = AsyncMock(side_effect=['token-1', 'token-2'])
+        self.live._token_refresh_due = Mock(return_value=True)
+        self.live._interruptible_sleep = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        with self.assertRaises(asyncio.CancelledError):
+            await self.live.token_refresh_loop()
+        self.assertEqual(2, self.live.refresh_token.await_count)
+        sockets[0].close.assert_awaited_once()
+        sockets[1].close.assert_awaited_once()
+
+    async def test_mismatched_database_cookie_never_authenticates_another_account(self):
+        self.db.get_cookie_details.return_value = {'value': COOKIES.replace('unb=123', 'unb=999')}
+        with patch('XianyuAutoAsync.aiohttp.ClientSession') as session:
+            self.assertIsNone(await self.live.refresh_token())
+        session.assert_not_called()
+        self.assertTrue(self.live.needs_relogin)
+        self.assertEqual('123', self.live.cookies['unb'])
+
+    async def test_terminal_wait_does_not_accept_another_accounts_cookie(self):
+        self.live._mark_relogin_required('expired')
+        self.live._cancel_background_tasks = AsyncMock()
+        self.db.get_cookie_details.return_value = {'value': COOKIES.replace('unb=123', 'unb=999')}
+        self.live._interruptible_sleep = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.live._hold_relogin_terminal()
+        self.assertTrue(self.live.needs_relogin)
+        self.assertEqual('123', self.live.cookies['unb'])
+
+    async def test_successful_probe_without_persistence_is_not_a_successful_refresh(self):
+        api = SimpleNamespace(get_order_count=AsyncMock(return_value={'ALL': 0}), cookies_str=COOKIES)
+        context = AsyncMock()
+        context.__aenter__.return_value = api
+        self.live.update_config_cookies = AsyncMock(return_value=False)
+        self.live._refresh_cookies_via_browser = AsyncMock(return_value=True)
+        with patch('utils.xianyu_seller_api.XianyuSellerAPI', return_value=context):
+            await self.live._execute_cookie_refresh(time.time())
+        self.assertEqual('invalid', self.live.last_cookie_refresh_status)
+        self.assertEqual(0, self.live.last_cookie_refresh_time)
+
     async def test_heartbeat_timeout_closes_half_open_connection(self):
         self.live.last_heartbeat_response = time.time() - 120
         await self.live.heartbeat_loop(self.live.ws)
@@ -458,6 +512,27 @@ class SellerFailureTests(unittest.IsolatedAsyncioTestCase):
                     await api.get_order_count()
         recover.assert_called_once()
         self.assertEqual(1, len(session.requests))
+
+    async def test_response_clearing_session_cookie_still_recovers_original_listener(self):
+        live = SimpleNamespace(_listener_loop=asyncio.get_running_loop(),
+                               cookies={'cookie2': 'session'}, _schedule_session_recovery=Mock())
+        session = Session([Response({'ret': ['FAIL_SYS_SESSION_EXPIRED'], 'data': {}}, ['cookie2=; Path=/'])])
+        api = XianyuSellerAPI('test', COOKIES, session=session)
+        with patch.object(XianyuLive, 'get_instance', return_value=live), \
+                patch.object(risk_control, 'registry', risk_control.RiskControlRegistry(6000)):
+            with self.assertRaises(SellerApiError):
+                await api.get_order_count()
+            await asyncio.sleep(0)
+        live._schedule_session_recovery.assert_called_once()
+
+    async def test_late_error_from_previous_scan_does_not_interrupt_new_session(self):
+        live = SimpleNamespace(_listener_loop=asyncio.get_running_loop(),
+                               cookies={'cookie2': 'new-session'}, _schedule_session_recovery=Mock())
+        api = XianyuSellerAPI('test', COOKIES)
+        with patch.object(XianyuLive, 'get_instance', return_value=live):
+            api._request_session_recovery(COOKIES)
+            await asyncio.sleep(0)
+        live._schedule_session_recovery.assert_not_called()
 
 
 class CookiePersistenceTests(unittest.TestCase):

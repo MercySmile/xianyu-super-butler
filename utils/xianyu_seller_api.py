@@ -83,14 +83,16 @@ class XianyuSellerAPI:
         self._session_failure = None
         self.failed_pages = []
 
-    def _request_session_recovery(self):
+    def _request_session_recovery(self, rejected_cookies=None):
         # This client may run on the HTTP loop. Cookie/WS recovery belongs to the
         # registered listener loop, never to a temporary profile or QR helper.
         from XianyuAutoAsync import XianyuLive
         live = XianyuLive.get_instance(self.cookie_id)
         loop = getattr(live, '_listener_loop', None)
         if live and loop and loop.is_running() and not loop.is_closed():
-            rejected_session = trans_cookies(self.cookies_str).get('cookie2')
+            # A failed response can clear cookie2. Compare the session we sent,
+            # not the cleared response cookie, against the current listener.
+            rejected_session = trans_cookies(rejected_cookies or self.cookies_str).get('cookie2')
             def recover_current_listener():
                 if (XianyuLive.get_instance(self.cookie_id) is live
                         and live.cookies.get('cookie2') == rejected_session):
@@ -199,6 +201,7 @@ class XianyuSellerAPI:
             url = self.BASE_URL.format(api=api, version=version)
             # 限流：控制每账号的请求速率，多账号并发时也不会突发
             await guard.acquire()
+            request_cookies = self.cookies_str
             async with session.post(
                 url,
                 params=params,
@@ -219,7 +222,7 @@ class XianyuSellerAPI:
 
             if is_session_expired(ret_list):
                 self._session_failure = SellerApiError(api, ret_list)
-                self._request_session_recovery()
+                self._request_session_recovery(request_cookies)
                 raise self._session_failure
 
             # 平台风控：立刻熔断，不重试
